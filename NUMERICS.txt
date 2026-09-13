@@ -1,0 +1,1243 @@
+======================================================================
+MassCascadeMC -- NUMERICAL METHODS, IMPLEMENTATION CHOICES, SAFEGUARDS
+======================================================================
+
+The notes below document the numerical construction of the Monte Carlo
+engine in masscascade.py, the modelling choices that enter the cascade,
+and the safeguards used to distinguish physical behaviour from numerical
+artefacts.
+
+The note numbers are referenced from comments in the source.  They are
+stable: new notes are appended, existing numbers are not reused.
+
+
+----------------------------------------------------------------------
+[1] MAJORANT COLLISION FREQUENCY (MCF) / MAJORANT-KERNEL SAMPLING
+----------------------------------------------------------------------
+
+Instead of computing and sampling the exact interaction rate of every
+particle pair directly, an upper-bound kernel
+
+                    fmaj >= K
+
+is used to generate trial pairs.  A selected pair (i,j) is accepted with
+probability
+
+                    P_accept = K_ij / fmaj_ij .
+
+The majorant determines the efficiency of the sampling, but not the
+physical interaction rate.  Provided that fmaj is a valid upper bound,
+the majorant cancels between pair selection and acceptance.
+
+The construction follows the Majorant Collision Frequency idea used in
+DSMC and stochastic coagulation methods:
+
+  - Ivanov & Rogasinsky, Sov. J. Numer. Anal. Math. Modelling 3, 453
+    (1988)                                      [MCF scheme in DSMC]
+  - Garcia, van den Broeck, Aertsens & Serneels, Physica A 143, 535
+    (1987)                                      [majorant for coagulation]
+  - Gillespie, J. Atmos. Sci. 32, 1977 (1975)
+                                            [exact stochastic coalescence]
+
+The implementation uses the same majorant-rate construction for pair
+selection while advancing the clock by the mean trial waiting time
+rather than drawing an additional exponential deviate; see note [5].
+
+
+----------------------------------------------------------------------
+[2] BIN-PAIR MAJORANT TABLE
+----------------------------------------------------------------------
+
+The majorant is not a single global number.  It is a matrix
+
+                    fmaj[b,c]
+
+over pairs of logarithmic mass bins.  Each entry is constructed from the
+upper mass corners of the two bins and bounds the kernel for every
+particle pair inside that bin pair.
+
+This has two purposes.
+
+  1. EFFICIENCY.  A global f_max = K(m_max, m_max) is formally valid for
+     a monotone kernel but becomes very loose over a broad mass range.
+     For a homogeneous kernel a typical acceptance scales approximately
+     as
+
+                    <K>/f_max ~ (m0/m_max)^lambda,
+
+     which falls by a factor 10^(-lambda) per decade covered by the
+     calculation.  With the bin table the corner overshoot is only
+     10^(0.1 lambda) per argument on a 0.1 dex grid.
+
+  2. A CHECKABLE BOUND.  Because the table is fixed by the bin geometry,
+     every trial can verify explicitly that
+
+                    K_ij <= fmaj_ij.
+
+     A violation raises an error rather than silently introducing a
+     biased acceptance probability.  A running global maximum would not
+     have this property: if it is not refreshed before a particle grows
+     past it, fmaj < K and the thinning is wrong without any symptom.
+
+The majorant cancels exactly from the physical pair rate:
+
+    (w R / 2V) * (fmaj_ij / R) * (K_ij / fmaj_ij)  =  w K_ij / (2V).
+
+The three factors are the total trial rate, the probability of selecting
+that pair, and its acceptance probability.  Any valid majorant therefore
+gives the same physical dynamics; a poor majorant only increases the
+number of rejected trials.  This cancellation requires the clock to
+advance on every TRIAL, including rejected trials; see note [5iv].
+
+One further consequence of a loose majorant is that the stall guard
+misfires: max_stall_tries counts trials without an accepted event, so at
+a very low acceptance a healthy run stops with the diagnosis
+"acceptance collapsed".
+
+For a binned efficient implementation of this construction, see
+
+  - Eibeck & Wagner, SIAM J. Sci. Comput. 22, 802 (2000),
+    doi:10.1137/S1064827599353488
+
+
+----------------------------------------------------------------------
+[3] O(1) BIN MEMBERSHIP WITH SWAP-WITH-LAST
+----------------------------------------------------------------------
+
+Each logarithmic mass bin stores a list of particle indices, `bins[b]`,
+and every particle stores its current position inside that list in
+`pos_in_bin`.
+
+Removal uses swap-with-last ("swap-and-pop"): the last particle in the
+bin list is moved into the position of the removed particle and the list
+is shortened by one element.
+
+Addition and removal are therefore O(1), with no search through the
+particles in the bin and no reallocation of the population arrays.  This
+matters because essentially every accepted coagulation or fragmentation
+event changes one or more bin memberships.
+
+The data-structure idea is standard; for a related use together with
+tree-based collision selection see
+
+  - Goodson & Kraft, J. Comput. Phys. 183, 210 (2002).
+
+
+----------------------------------------------------------------------
+[4] INCREMENTAL RATE MAINTENANCE
+----------------------------------------------------------------------
+
+Define
+
+                    T[b] = sum_c fmaj[b,c] N_c ,
+
+where N_c is the occupation of mass bin c.
+
+T is not recomputed from the full matrix after every event.  When the
+population of one bin changes, the entire vector T is updated by a single
+vector operation using the corresponding column of the majorant table.
+
+The pair-selection weights are then constructed from T and sampled with
+vectorised cumulative sums and `searchsorted`, rather than with a Python
+loop over mass bins.
+
+The bookkeeping cost therefore scales with the number of bins B, rather
+than with the number of particle pairs.
+
+For substantially larger B, the same cumulative-rate problem can be
+handled with a Fenwick/binary tree and O(log B) updates; see
+
+  - Goodson & Kraft, J. Comput. Phys. 183, 210 (2002).
+
+
+----------------------------------------------------------------------
+[5] THE PHYSICAL CLOCK
+----------------------------------------------------------------------
+
+The clock is the part of a majorant calculation in which the
+pair-selection distribution and the physical interaction rate must
+remain consistent.
+
+  (i) ORDERED VS UNORDERED PAIRS.
+
+      The maintained quantity
+
+          R = sum_b N_b (T_b - fmaj[b,b]) = sum_{i != j} fmaj_ij
+
+      counts ordered pairs, so every physical unordered pair appears
+      twice.  The corresponding mean trial-time increment is
+
+                    dt = 2 V / (w R).
+
+      The factor of two affects only the physical time scale; pair
+      selection itself is unchanged because both orderings represent the
+      same physical pair.  Omitting it rescales t by exactly 2 and breaks
+      any comparison with an analytic solution.
+
+  (ii) PARTICLE WEIGHT.
+
+      The implementation keeps a constant particle weight w.  For the
+      baseline calculations w = 1, so one simulated particle represents
+      one physical particle.  Nothing in the engine ever changes w.
+
+      Keeping w explicitly in
+
+                    dt = 2 V / (w R)
+
+      makes the density scaling transparent and keeps the expression
+      consistent with a constant-weight formulation.
+
+      The injection and distributed-sink channels contain w in different
+      intermediate places, for a physical reason.  Injection is specified
+      externally in physical particles per unit time and therefore
+      converts that physical rate into a number of simulated particles.
+      The distributed sink is generated from the simulated population
+      itself: its physical rate contains a factor w, and conversion back
+      to simulated particles removes the same factor, so the resulting
+      siphon quota is independent of w.
+
+  (iii) BINARY SCALING.
+
+      Because collisions are binary,
+
+                    R ~ N^2   and therefore   dt ~ N^-2.
+
+      A clock proportional to N^-1 would correspond to a unary process
+      and would produce the wrong physical evolution.
+
+  (iv) TIME ADVANCES ON EVERY TRIAL.
+
+      The clock advances immediately after the majorant trial rate is
+      formed, before the K/fmaj acceptance test.  Rejected majorant
+      trials are null events of the sampling process and consume physical
+      time as well.  This is what makes the cancellation in note [2]
+      work:
+
+          trial rate
+          x probability of selecting (i,j)
+          x probability of accepting (i,j)    ->   w K_ij / (2V).
+
+      Advancing the clock only for accepted events would make the
+      physical time depend on the efficiency of the majorant.  The
+      reported rate would be R instead of R * <K/fmaj> = sum K, and with
+      a global f_max the effective step would be
+
+                    dt_eff ~ 1 / (N^2 m_max^lambda),
+
+      i.e. the kernel entering through the extreme of the distribution
+      instead of through the typical mass.  In an open system m_max is
+      pinned at the sink and does not grow, so the m0 dependence leaves
+      the clock entirely, the drift degenerates to
+
+                    dm0/dt ~ m0   (beta = 1),
+
+      and the constant-flux argument then returns alpha = -2 for every
+      kernel.  This is a purely numerical route to the same -2
+      fingerprint that note [8] produces physically.
+
+  (v) DETERMINISTIC MEAN-RATE CLOCK.
+
+      The code advances each majorant trial by its mean waiting time,
+
+                    dt = 2 V / (w R),
+
+      rather than multiplying this expression by an independent
+      exponential deviate.  The calculation therefore reproduces the
+      mean-field collision-rate evolution while suppressing an additional
+      source of clock noise.  Pair selection and event acceptance remain
+      stochastic.
+
+      This is not an exact Gillespie continuous-time Markov-chain
+      realisation, in which the waiting time itself would also be
+      exponentially distributed.
+
+
+----------------------------------------------------------------------
+[6] DETERMINISTIC RESIDUAL SOURCE AND SINK
+----------------------------------------------------------------------
+
+Boundary channels whose total rates are known continuously use fractional
+residual accumulators rather than independent Poisson draws.
+
+If a channel should produce a mean number q*dt of simulated events during
+one time step, its residual is updated as
+
+                    r <- r + q dt.
+
+The integer part fires immediately and the fractional part is carried
+into the next step.  The integrated number of source/sink events
+therefore follows the imposed mean rate without an additional shot-noise
+component.
+
+The same construction is used by the deterministic injector and by the
+distributed first-order sink of note [16].
+
+Removing the channel's own Poisson noise matters most for the
+distributed sink, because that sink acts inside the inertial range, where
+removal shot noise would contribute directly to the measured spectral
+fluctuations.
+
+This changes HOW MANY boundary events occur over a given interval, not
+the stochastic rule selecting WHICH particles are involved.  The
+deterministic character of the imposed injection is a modelling choice
+and is recorded in the run metadata.
+
+
+----------------------------------------------------------------------
+[7] AGE AND GENERATION BOOKKEEPING
+----------------------------------------------------------------------
+
+The code carries two complementary descriptions of motion through mass
+space.  Age labels an ENSEMBLE at a given time since an assigned birth or
+injection clock.  Generation labels the number of mass-changing steps
+separating a particle from the body that entered the system.  These
+observables answer different questions and are not interchangeable
+trajectory measurements.
+
+---- AGES ------------------------------------------------------------
+
+Every particle carries `inj_time`.  The age used by the isochrone
+histogram is
+
+                    tau = t_phys - inj_time.
+
+In an open system, accumulation may be delayed until a prescribed
+sink-throughput gate `iso_start_sink` has been reached.  A sink-count
+gate states directly that material has crossed the cascade and does not
+depend on the absolute clock normalisation.  A closed system has no sink,
+so the default gate is disarmed there.
+
+COAGULATION.  A merger product has two ancestors, so an explicit
+inheritance rule is unavoidable.  `age_rule` may use the minimum age,
+maximum age, mass-weighted age, or the age of the heavier parent.
+
+Injection clocks are always created at m_inj.  An age class therefore
+starts from a well-defined physical mass and <m>(tau) can be interpreted
+as an ensemble growth law.  Because different inheritance rules weight
+different parts of the merger tree, the chosen rule is reported in the
+metadata and its sensitivity should be checked when an age-based growth
+exponent is quoted.
+
+FRAGMENTATION.  A fragment has one parent, but two children are produced,
+so one must still decide which child retains the parent's age clock:
+
+    'inherit'   both fragments retain the parent's clock;
+    'heavier'   the heavier fragment retains it, the lighter receives a
+                new clock;
+    'lighter'   the lighter fragment retains it;
+    'both_new'  both fragments receive new clocks.
+
+Under 'inherit', an age class represents the whole surviving descendant
+family of an injected body.  It is an ensemble over a branching tree, not
+a single fragmentation trajectory, and a diagnostic of this is that the
+median age equals the maximum age.  A broad mass distribution inside one
+age class is therefore not by itself evidence against a multiplicative
+cascade.
+
+---- GENERATIONS -----------------------------------------------------
+
+Every particle also carries `gen`, the number of mass-changing
+generations separating it from the body that entered the system, and
+`gen_time`, the time at which that ancestor entered.  A snapshot
+accumulates a two-dimensional histogram in
+
+                    (generation, mass)
+
+in the same way that the age machinery accumulates (age, mass).
+
+The generation variable removes the need to infer the number of
+multiplicative steps from a small population of tagged tracers.  For
+fragmentation,
+
+                    x = ln(m/m0)
+
+is a sum of logarithmic split increments; if successive increments are
+independent, both <x> and Var(x) are linear in generation.
+
+Generation is a property of every live particle, so the full population
+contributes.  This avoids three limitations of sparse trajectory tracers:
+
+  - statistics are not limited by the small number of complete trees
+    surviving across the whole cascade;
+  - long waiting times near the injection scale do not dominate the
+    sampling merely because a tracer spends most of its time there;
+  - a particle contributes while it is alive and does not need to survive
+    all the way to the sink.
+
+Accumulating age together with generation also gives <tau>(g), the mean
+time required to reach generation g.  For fragmentation, schematically,
+
+    dg/dtau ~ nu(m) ~ m^(beta-1),
+
+while the logarithmic mass changes by an O(1) amount at every split.  For
+the mass-weighted path associated with a uniform split, <ln xi> = -1/2,
+giving
+
+                    tau(g) = T [1 - exp(-g/(2b))]
+
+for the corresponding exponential-generation model, with b the growth
+exponent of note [14].
+
+A generation histogram remains an ENSEMBLE at fixed g.  It does not
+preserve the identity of a complete trajectory and therefore cannot
+measure correlations between successive increments of one tagged path.
+Independence is instead tested through the predicted linearity of the
+generation moments.
+
+NUMBER- AND MASS-WEIGHTING ARE DIFFERENT.  A path that selects a fragment
+with probability proportional to its mass is size-biased.  For a uniform
+split this gives
+
+                    <ln xi> = -1/2,   Var(ln xi) = 1/4.
+
+A generation histogram that counts BOTH fragments equally is
+number-weighted instead and gives
+
+                    <ln xi> = -1,     Var(ln xi) = 1.
+
+Weighting the generation histogram by mass recovers the
+trajectory-weighted values.
+
+For an unbounded logarithmic split increment the one-step distribution is
+asymmetric, with an exponential logarithmic tail, and the skewness of one
+step is -2.  A rule that follows only the heavier piece is bounded,
+xi in [1/2,1], and is nearly symmetric.  The skewness after g independent
+steps decreases as -2/sqrt(g), so the asymmetry is a finite-generation
+effect rather than a failure of the central-limit picture.
+
+INHERITANCE.  In fragmentation both children receive gen+1 and retain
+`gen_time`, so t - gen_time always measures the time since their common
+ancestor entered, independently of the separate `frag_age_rule`.  In
+coagulation the merger product receives
+
+                    max(gen_i, gen_j) + 1
+
+together with the older ancestral `gen_time`.  Newly injected particles
+begin at gen = 0.  Generations above `gen_max` are collected in an
+overflow counter, reported as `gen_overflow`.
+
+
+----------------------------------------------------------------------
+[8] LOCALITY OF THE INTERACTION RULE
+----------------------------------------------------------------------
+
+A scale-free stationary cascade requires the collision integral carrying
+the flux to be local: interactions at mass m must not be dominated by
+particles arbitrarily far away in mass.
+
+For fragmentation, consider a rule in which the heavier member of an
+interacting pair breaks irrespective of how small its collision partner
+is.  The disruption rate of a particle of mass m0 contains
+
+    nu(m0) ~ integral_{m' < m0} F(m') K(m0,m') dm'  ~  integral x^alpha dx,
+
+with x = m'/m0 near x -> 0.  For alpha < -1 this integral diverges at the
+lower limit.  The disruption rate is then controlled by the smallest
+particles in the box, i.e. by the numerical sink scale rather than by m0.
+
+The consequences are physical rather than merely numerical:
+
+  - the local mean-field closure is no longer applicable;
+  - the drift becomes proportional to m0,  dm0/dtau ~ -C m0;
+  - beta -> 1 and the measured spectrum approaches alpha = -2
+    independently of the intended kernel.
+
+Such an apparent "universal" -2 spectrum is a boundary-dominated
+non-local solution, not the local constant-flux solution.
+
+The physical remedy is analogous to the catastrophic-disruption threshold
+used by Dohnanyi (1969): a sufficiently small projectile cannot
+catastrophically disrupt an arbitrarily larger target.  The code imposes
+the scale-free condition
+
+                    m_small >= f * m_large,
+
+with f of order 0.1-1.  Because f is a dimensionless mass ratio, this
+introduces no preferred mass scale.  The collision integral is restricted
+to x in [f,1], restoring locality while preserving the homogeneity degree
+of the kernel.  The expected local open-system spectrum is then
+
+                    alpha = -(3 + lambda)/2.
+
+The implementation of the condition, for both processes, is note [17].
+
+In a narrow closed self-similar packet the interaction partners are
+already of comparable scale, so the same non-local divergence is absent
+even at f = 0.
+
+Locality and age inheritance are separate.  The locality parameter f
+changes which physical interactions are allowed and can therefore change
+the spectrum.  `frag_age_rule` changes only the label carried by the
+fragments and cannot change the instantaneous mass dynamics.
+
+
+----------------------------------------------------------------------
+[9] NO POPULATION RESAMPLING OR WEIGHT THINNING
+----------------------------------------------------------------------
+
+The engine avoids population-control resampling.  Every simulated
+particle represents one physical particle and
+
+                    w = 1
+
+remains fixed throughout the calculation.
+
+Here "no thinning" refers to population/weight thinning; it does NOT
+refer to the K/fmaj rejection step of the majorant sampler in notes
+[1]-[2].
+
+The consequences are:
+
+  + mass bookkeeping is direct: Sum(w) and Sum(w*m) are conserved to
+    machine precision, `mass_drift` is identically zero, and a nonzero
+    value is a bug rather than a statistical excursion;
+  + no cloning, down-sampling, or adaptive particle weights can modify
+    the measured spectrum;
+  + the physical clock reduces to dt = 2V/R.
+
+The cost is dynamic range.
+
+COAGULATION.  In a closed mass-conserving population the number of live
+particles decreases approximately as
+
+                    N ~ N_i m_i / m0,
+
+so keeping of order 100 particles alive requires m0 <= N_i/100: about
+four decades at N_i = 1e6 and six at N_i = 1e8.  A run pushed past that
+ends with a handful of particles and a much shorter usable plateau.
+
+FRAGMENTATION.  The difficulty is reversed.  The number of fragments
+grows roughly as the characteristic mass decreases, so memory usage
+becomes the limiting resource before the desired low-mass range is
+reached.
+
+This baseline therefore trades achievable dynamic range for the simplest
+statistical interpretation: no population resampling and no variable
+particle weights.  A weighted or population-controlled implementation can
+extend the accessible range, but then the resampling algorithm becomes
+part of the numerical method and must be validated separately.
+
+
+----------------------------------------------------------------------
+[10] SNAPSHOT PLACEMENT
+----------------------------------------------------------------------
+
+Snapshot placement matters differently in open and closed systems.
+
+OPEN SYSTEM.  Once a stationary state has been reached, the observable is
+the instantaneous stationary spectrum averaged over post-gate snapshots.
+The time increment dt does not enter the estimator, so placement is free
+and snapshot_mode='events' is adequate.
+
+CLOSED SYSTEM.  No stationary spectrum exists.  The relevant quantity is
+the time-integrated superposition
+
+                    F(m) = integral n(m,t) dt,
+
+evaluated numerically as F(m) ~= sum_k n(m,t_k) Delta t_k.
+
+Snapshot sampling therefore has two separate roles, which must not be
+confused:
+
+  PLACEMENT determines which stages of the evolving distribution are
+  resolved.  For a given m the integrand peaks while m0 ~ m, so every
+  decade of m needs snapshots at the matching decade of m0.
+
+  WEIGHT determines the value of the integral and must always be the
+  actual physical Delta t between samples.
+
+Three placement choices are available:
+
+  'events'   Uniform sampling in event number.  The number of events per
+             unit m0 falls as 1/m0^2, so the physical time represented by
+             one event grows strongly during the evolution and late
+             snapshots carry most of the total Delta t weight.  The
+             integral then reduces to a few self-similar packets, and the
+             plateau finder can still report a narrow, internally
+             consistent plateau at the wrong index.
+
+  't_phys'   Uniform physical-time sampling.  Adequate over a narrow
+             dynamic range.  Over many decades it places too few
+             snapshots during the early low-mass stages: since
+             t ~ m0^(1-lambda), uniform t is nearly uniform m0, and F(m)
+             at small m is then assembled from the flat cores of much
+             larger packets, n ~ m0^-2 Phi(m/m0 -> 0), which is
+             independent of m and drives alpha towards 0.
+
+  'log_m0'   Sampling whenever the characteristic mass advances by a
+             fixed amount in log m0 gives approximately the same number
+             of snapshots per mass decade.  This follows the support of
+             the integrand and is the placement to use for closed runs
+             spanning more than about two decades.
+
+Whatever placement is chosen, the Riemann sum must use the actual
+physical Delta t between neighbouring snapshots.
+
+Population resampling [9] and snapshot placement [10] address different
+problems.  Population control determines how much dynamic range can be
+simulated; snapshot placement determines whether the observable is
+measured correctly over that range.  A run can have exact dynamics and a
+meaningless spectrum.
+
+
+----------------------------------------------------------------------
+[11] FRAGMENT SPLIT WIDTH
+----------------------------------------------------------------------
+
+A fragmentation event divides a parent of mass m into xi*m and (1-xi)*m,
+where
+
+            xi ~ Uniform(0.5 - w, 0.5 + w),   w = frag_split_width.
+
+The choice w = 0.5 corresponds to a uniform split fraction over (0,1).
+
+Reducing w makes individual fragmentation steps more nearly equal and
+therefore makes age and generation tracks narrower.  It also reduces the
+dispersion in logarithmic mass added by each generation.
+
+Successive generations overlap only after their random spread has become
+comparable to their mean separation.  Schematically this requires
+
+                    g ~ (mu / 2 sigma)^2
+
+steps, where mu and sigma describe the mean and dispersion of the
+logarithmic mass decrement, while the cascade takes about 6/mu of them.
+If the split distribution is too narrow, the generations remain separated
+through a significant part of the cascade and the spectrum develops a
+persistent comb ("picket fence") at the characteristic logarithmic split
+interval.  Below about w = 0.25 the modulation becomes significant.
+
+This is a SYSTEMATIC effect, not ordinary Monte Carlo variance.
+Increasing the number of particles does not fill masses that the
+fragmentation rule itself rarely produces.  A power-law fit through such
+a comb returns a shifted spectral index with a small formal uncertainty.
+
+Narrow split distributions should therefore be checked against the raw
+mass histogram.  Narrowing the split is not the way to obtain narrow age
+or generation sequences; that is what `frag_age_rule` does, note [7].
+
+
+----------------------------------------------------------------------
+[12] WARM START
+----------------------------------------------------------------------
+
+A cold open-system run starts with its population concentrated near the
+injection scale and must build the stationary cascade across the entire
+mass interval before the steady spectrum can be measured.
+
+The relevant cost is of order the mass residence time,
+
+                    tau_res = M_sys / (q m_inj),
+
+i.e. the time required for the injected flux to replace the mass stored
+in the box.  Across a broad inertial range this transient can dominate
+the computational cost.
+
+A warm start instead initialises the population with a power-law
+distribution spanning the cascade, ic={'steady': {...}}.
+
+This can remove most of the filling transient, but it is legitimate only
+if the stationary spectrum is demonstrated to be an ATTRACTOR rather than
+imposed by the initial condition.  The validation is to initialise the
+system with deliberately incorrect slopes, preferably on both sides of
+the predicted stationary value, and verify that the independent runs
+converge to the same final spectrum.  Starting from the theoretical slope
+and recovering that same slope is not an independent demonstration of
+convergence.
+
+A synthetic warm population has a second limitation: seeded particles
+have no physical ancestry inside the simulation, so their split count,
+injection age and family history are undefined.  Consequently:
+
+  - the steady-state mass spectrum may be measured from a validated warm
+    start;
+  - ancestry-based observables such as generation, inherited age and
+    family history must exclude synthetic seed descendants until those
+    have been replaced by particles originating from the real injection
+    channel.
+
+The code marks this distinction explicitly, note [13], so that
+acceleration of the stationary-spectrum calculation cannot contaminate
+the trajectory and generation diagnostics.
+
+The seeded masses are drawn by inverse CDF in logarithmic variables
+(`sample_powerlaw`), because the direct power form loses most of the
+mantissa at the light end over several decades.
+
+
+----------------------------------------------------------------------
+[13] THE INHERITED HONESTY MARK: gen = -1
+----------------------------------------------------------------------
+
+Seeded bodies receive gen = -1 instead of 0, and the mark propagates:
+
+    fragmentation: gen(child)  = -1 if gen(parent) < 0, else gen+1
+    coagulation:   gen(merged) = -1 if either parent is < 0
+    injection:     gen = 0
+
+so contamination can spread but never heal.
+
+Everything with gen < 0 is excluded from gen_counts, gen_num, gen_tau and
+the overflow count.  `honest_num` and `honest_mass` report, at every
+snapshot, the fraction of the population that is free of seed ancestry.
+Seeded bodies wash out on the residence time, so the honest fraction is a
+direct readout of how far a run has progressed.
+
+`gen_time` of a seeded body is -inf rather than 0, so that a missing age
+is obviously absent rather than silently plausible.
+
+
+----------------------------------------------------------------------
+[14] THE WAITING LAW
+----------------------------------------------------------------------
+
+For a particle sitting at mass m, let dt be the time until the next event
+that CHANGES ITS MASS (it is disrupted, or it merges).  Its mass is
+constant over that whole interval by construction, so the interval
+belongs unambiguously to one mass bin, and
+
+    <dt>(m) ~ 1/nu(m),    nu(m) = Int K(m,m') n(m') dm'.
+
+Since one event changes m by a factor of order unity, dm ~ m, and with
+the growth law m ~ t^b, dm/dt ~ m^(1-1/b):
+
+                    <dt> ~ dm / (dm/dt) ~ m^(1/b).
+
+The observable therefore measures b directly, without going through
+alpha, where db/dalpha = b^2 amplifies the error.
+
+Three properties make it usable on a warm start:
+
+  - MEMORYLESS.  It asks nothing about where the particle came from, so
+    seeded bodies contribute from the first event.
+  - LOCAL.  The interval is attributed to the bin the particle actually
+    sits in, not to a trajectory crossing the whole range, so the sink
+    censors only the bins next to it.
+  - UNBIASED BY CONSTRUCTION.  Every interval is recorded exactly once,
+    at the moment it ends, so there is no length bias from inspecting the
+    population at snapshot times.  The only loss is censoring of the
+    intervals still open when the run stops.
+
+The price is dynamic range: 1/b is small, so <dt> changes slowly across
+the range.  A shallow slope needs a long arm and clean bins, so the fit
+should use a guard band excluding a decade at each end.
+
+Both an UNGATED accumulator (from t = 0) and a GATED one (after the
+iso_start_sink gate) are kept, so the size of the transient contamination
+is measurable rather than assumed.
+
+THE DISTRIBUTED SINK CENSORS, IT DOES NOT COUNT.  A particle removed by
+the sink of note [16] did not change mass; its interval was cut short.
+`wait_close` is therefore not called on it, and two estimators are kept
+side by side:
+
+  - `exposure` = Int N_b dt / (number of stays that ENDED).  The
+    occupancy the removed particle accrued is already in the numerator,
+    because delete_particle flushes the integral before N_bin moves,
+    while its unfinished stay never enters the denominator.  Both halves
+    are consistent, so the estimator stays unbiased at any xi0.
+  - `interval` = mean over stays that ended.  Censored stays are missing,
+    and they are the long ones, so the mean is pulled down where the sink
+    acts most strongly.
+
+The gap between the two is a consistency check when the sink is off and a
+measure of its strength when it is on.
+
+
+----------------------------------------------------------------------
+[15] RESTART FROM A SAVED STATE
+----------------------------------------------------------------------
+
+ic={'state': {...}} restores mass, gen, gen_time and inj_time from a
+finished run.  Nothing is reset.  After a cold run every particle already
+carries an honest split count -- the number of breakups since its
+ancestor entered at m_inj -- so the relation between generation and mass
+is intact and the honest fraction of note [13] is 1 from the first event.
+This is the difference from the synthetic power-law seed of note [12],
+where there is no history to inherit.
+
+THE TIME OFFSET.  Every inherited timestamp is shifted back by the
+previous leg's end time and therefore lands negative.  Those particles
+did enter before t = 0, so tau = t_phys - t_anc returns the full age
+across the seam instead of restarting it.  Without this, a run shorter
+than one residence time yields a tau(g) curve that saturates at t_end and
+an apparent growth exponent that is censored downwards.
+
+RESTARTS COMPOSE.  Each leg subtracts its own end time and adds it to
+`t_origin`, so t_origin + final_t_phys is the total age of the box over
+any number of legs.  The run length therefore does not have to be guessed
+in advance: run, checkpoint, test stationarity, and either stop or
+continue from the checkpoint.
+
+HOW LONG IS ENOUGH.  Two commonly used criteria do not detect a spectrum
+that is still evolving.  The ratio of removed to injected mass satisfies
+
+    M_out = M_in + M_sys(0) - M_sys(t),   so   M_out/M_in = 1 + dM/M_in,
+
+which tends to 1 because M_in grows without bound; it says only that the
+run outlived the filling transient.  The same applies to the number of
+absorbed particles per event.  Stationarity should instead be judged on
+<m> and alpha compared between the two halves of the tail of the run.
+
+
+----------------------------------------------------------------------
+[16] THE DISTRIBUTED SINK
+----------------------------------------------------------------------
+
+A removal acting on every particle at once,
+
+    xi(m) = xi0 * (m/m_ref)^omega          [rate PER PARTICLE],
+
+as opposed to `sink_mass`, which is an absorbing wall at one end of the
+range.  Being first order in the population, it enters the stationary
+balance as a loss term linear in n,
+
+                    d(rho v_m)/dm = -xi(m) rho.
+
+The absorbing wall is the omega -> infinity limit of the same object;
+both channels are available at once and do not interfere.
+
+THE ALGORITHM, in three parts.
+
+ (i) THE RATE, from the population and nothing else.  The engine keeps
+
+                S_pow = sum over live particles of m^omega
+
+     exactly, by O(1) updates at every mass change: injection,
+     coagulation, fragmentation, absorption at the wall, and the sink
+     itself.  The total removal rate is xi0 * w * S_pow.  Once per
+     snapshot S_pow is re-derived from the array and the worst relative
+     discrepancy is reported as out["siphon_spow_drift"].  This is a bug
+     detector, not a tolerance: a few 1e-9 is float64 cancellation, orders
+     of magnitude more is a missed update.
+
+ (ii) THE QUOTA, deterministic, note [6].  siphon_residual accumulates
+     xi_amp * S_pow * dt and only its integer part fires; the remainder is
+     carried forward.  No Poisson number is drawn, so the channel adds no
+     shot noise.  The weight cancels exactly, note [5ii].
+
+ (iii) THE VICTIM, by rejection at the level of the POPULATION.  Draw a
+     particle uniformly and accept with probability (m/m_bound)^omega.
+     The normalisation cancels:
+
+        P(i) = [xi0 S_pow dt] * (m_i/m_b)^omega / sum_j (m_j/m_b)^omega
+             = xi0 m_i^omega dt,
+
+     so the scheme samples xi(m_i) dt independently for every particle,
+     exactly, and needs no histogram, no cumulative sum and no tree.
+
+WHY NOT "DRAW A MASS FROM m^omega AND TAKE THE NEAREST PARTICLE".  The
+spacing between neighbouring masses is the inverse of the local density,
+so snapping a draw to the nearest body gives
+
+                P(i) ~ m_i^omega dm_i ~ m_i^omega / n(m_i),
+
+i.e. an effective rate xi_eff = xi0 m^omega / n(m), non-linear in n.  The
+loss term is then not -xi rho, and such a sink removes a fixed number per
+unit time from the sparse end of the range instead of a fixed fraction.
+
+THE BOUND.  Part (iii) needs the supremum of m^omega over the LIVE
+population.  In each of the four configurations it is known before the run
+starts and never moves:
+
+    fragmentation, omega < 0 : nothing alive is lighter than the sink
+    fragmentation, omega > 0 : nothing ever gets heavier than what entered
+    coagulation,   omega > 0 : nothing alive is heavier than the sink
+    coagulation,   omega < 0 : nothing ever gets lighter than what entered
+
+The extremum over {sink, injection mass, seed} covers all four and stays
+valid when the seed extends past the wall.  A running record of m_min or
+m_max would degrade instead: in fragmentation m_min is written on a
+fragment before the wall deletes it, so the record walks below sink_mass
+and the acceptance never recovers.  A violated bound raises, exactly as a
+violated pair majorant does, note [2].
+
+THE COST.  Acceptance is <(m/m_b)^omega> over the live spectrum.  For a
+small |omega| on a power-law spectrum this is of order one, so the channel
+costs little; it becomes expensive only at |omega| of order one, where a
+per-bin bound would be needed instead.
+
+EVENTS ARE SEPARATE, MASS IS SUMMED.  `sink_events`/`n_out` and
+`siphon_events`/`n_siphon` are never mixed, and neither are `M_out` and
+`M_siphon`: the two routes answer different questions.  Two places add
+them, for two different reasons:
+
+  - STATIONARITY, on mass.  M_removed = M_out + M_siphon, and the
+    criterion is M_removed/M_in -> 1.  Sink events alone say nothing about
+    settling, because a strong distributed sink removes material near the
+    injection scale while nothing has crossed the range; mass is conserved
+    whichever way it left.  `mass_drift` uses the same sum and stays
+    identically zero.
+  - THE GATES, on counts, when gate_counts_siphon is on (the default
+    whenever the distributed sink is).  Only (m_sink/m_inj)^delta0 of the
+    flux reaches the wall, so a gate counting the wall alone would open
+    much later and would stop runs at different delta0 at different
+    degrees of convergence.  Total removal equals total injection in the
+    steady state at any delta0, which makes the sum the delta0-independent
+    gate.  The price is that it no longer certifies that mass crossed the
+    whole range, only that the box turns over.
+
+CALIBRATION.  The analytic prediction is written in
+
+                delta0 = xi0/D,     nu = omega + 1 - beta,
+
+where D, the drift amplitude, is emergent rather than an input and must be
+measured on a pilot run with siphon=None.  Two routes exist.
+
+THE FLUX ROUTE.  In the steady state the mass flux in mass space is the
+injected one, J = q m_inj, and the Eulerian drift velocity follows from it
+and from the measured spectrum alone:
+
+    v(m) = J/rho(m),  rho = m F(m)
+      =>  tau_drift(m) = m/|v| = m^2 F(m)/J = (A_F/J) m^(2+alpha),
+
+with A_F and alpha the amplitude and index of the fitted spectrum.  The
+exponent obeys 2 + alpha = 1 - beta, so it doubles as a check on the fit.
+Nothing here assumes anything about the collision integral, so it holds
+for both processes.  It is passed as
+siphon={'delta0':.., 'nu':.., 'tau_drift':(A_F/J, 2+alpha)}.
+
+THE WAITING-LAW ROUTE.  <dt> = A m^(1/b) with 1/b = 1 - beta gives
+tau_drift = <dt>/c, c = out["dlnm_mean"].  It is the sharper measurement
+where the collision integral is LOCAL.  Fragmentation with a disruption
+threshold f > 0 is local, note [8], and there the two routes agree.
+Coagulation off a spectrum steeper than m^-1 is not: nu(m) is dominated by
+m' ~ m_inj, so <dt> falls with mass and even the sign of the exponent is
+not 1 - beta.  Both numbers are finite, so the engine cannot detect this;
+the choice of route belongs to the caller.
+
+
+----------------------------------------------------------------------
+[17] THE LOCALITY WINDOW: IMPLEMENTATION
+----------------------------------------------------------------------
+
+Two bodies interact only if their masses are comparable,
+
+                    m_small >= f * m_large,
+
+set by `frag_min_ratio` for fragmentation and `coag_min_ratio` for
+coagulation.  f = 0 removes the condition.  The physical motivation is
+note [8]; this note describes the implementation and what it does and does
+not change.
+
+The same rule applies to both processes.  Without it, fragmentation
+connects the sink scale directly to every mass above it, and coagulation
+has the mirror-image problem: with a kernel that does not vanish for
+m' << m, a large body grows mostly by absorbing the smallest ones, so
+every scale is tied to the injection scale instead of to its neighbours.
+
+WHEN IT MATTERS.  The constant-flux solution n ~ m^-p exists only where
+the collision integral carrying the flux converges.  At the edge of the
+convergence window the integral diverges logarithmically from the m' << m
+region, the cascade is non-local, and the spectrum is set by the
+boundaries rather than by the kernel.  The additive kernel, lambda = 1,
+sits exactly there.  The signature is visible in the data:
+
+  - the local slope of a lossless run does not collapse as a function of
+    m, but does collapse as a function of log m / log m_sink;
+  - Gamma crosses -(1+beta) near the middle of the range whatever the box
+    size;
+  - the total swing of Gamma across the range is the same in boxes of
+    different size, so a larger box stretches the same curve and never
+    produces a plateau.
+
+Below the edge of the window, lambda < 1, the integral converges by itself
+and f only trims a region that contributes little.
+
+WHAT IT DOES NOT CHANGE.  The condition involves the ratio alone, so
+
+                K_eff = K * Theta[min/max - f]
+
+is homogeneous of the same degree as K.  beta = (1+lambda)/2, b and alpha
+are unchanged.  Mass conservation is untouched: a forbidden pair is a NULL
+EVENT, and null events change nothing.
+
+WHAT IT DOES CHANGE.  The flux amplitude, downwards, because the
+interactions removed are the ones that carried most of it; the same
+spectrum is therefore reached more slowly in physical time.  The random
+stream also differs from an unrestricted run, so runs at different f are
+statistically comparable but not bit-comparable.
+
+HOW IT IS IMPLEMENTED, in two places that are one rule.
+
+ (a) THE BAND, in the majorant table.  A bin pair whose most favourable
+     member already fails the test has K_eff = 0 throughout, and its entry
+     is zeroed.  Without this, the test would be enforced by rejection
+     alone and the acceptance would collapse: at f = 0.3 on a 0.1 dex grid
+     only about a dozen bins around the diagonal survive.
+
+     This is exact, not an approximation.  A trial selects a pair with
+     probability fmaj_ij/R and accepts with K_ij/fmaj_ij, so the realised
+     rate is proportional to K_ij and fmaj cancels.  Deleting pairs with
+     K_eff = 0 lowers R, which lengthens dt = 2V/(wR) per trial by exactly
+     the factor by which the number of trials falls.  The physical clock
+     does not move.
+
+ (b) THE TEST, per pair, before the majorant thinning.  Bins have width,
+     so pairs at the edge of the band are only partly allowed and are
+     checked individually.  The test is placed before the thinning draw
+     because a banded-out pair has fmaj = 0 while K > 0 and would
+     otherwise trip the majorant-violation guard.
+
+
+----------------------------------------------------------------------
+[18] THE MASS GRID
+----------------------------------------------------------------------
+
+`edges` is a 1D strictly increasing array of mass-bin edges, supplied by
+the caller.  It fixes three things at once:
+
+  - the bins used for O(1) membership, note [3];
+  - the bin pairs of the majorant table, note [2], whose entries are built
+    from the upper corners of each bin, so the corner overshoot -- and
+    hence the acceptance -- is set by the bin width;
+  - the resolution of every histogram the engine returns.
+
+The grid is logarithmic in practice.  Counts are accumulated per bin and
+converted to dN/dm by dividing by the bin width, so the returned `dndm` is
+a density in m, not in ln m.  A slope quoted as dN/dm ~ m^alpha is
+therefore related to a log-binned histogram by
+dn/dln m ~ m^(alpha+1).
+
+The grid must extend beyond the working range at both ends.  A rising last
+bin indicates pile-up: the flux has nowhere to go, and both alpha and b
+are affected.  Keep the characteristic mass at least two decades inside
+max(edges), or use an absorbing boundary and drop the extreme bins from
+every fit.
+
+
+----------------------------------------------------------------------
+[19] RANDOM NUMBERS
+----------------------------------------------------------------------
+
+All randomness is drawn from a single `numpy.random.Generator` passed as
+`rng`.  If none is given, a fresh default_rng is created, and the run is
+then not reproducible.
+
+The engine does not record the generator's seed.  The metadata field
+`seed` describes the warm-start power-law seed of note [12] -- its index,
+range and particle count -- not the random number generator.
+Reproducibility of a run is therefore the caller's responsibility:
+construct the Generator with an explicit seed and store that seed
+alongside the output.
+
+Channels that are switched off draw no random numbers at all, so enabling
+or disabling them changes the stream.  Two runs are comparable
+bit-for-bit only at identical settings; otherwise they are comparable
+statistically.
+
+
+----------------------------------------------------------------------
+[20] WHAT A RUN RETURNS
+----------------------------------------------------------------------
+
+`simulate` returns a dict of arrays, one entry per recorded snapshot,
+together with a `meta` sub-dict and the final per-particle state.
+
+The arrays include the spectrum `dndm` on the grid of note [18], the
+characteristic mass and mean mass, the isochrone histogram in (age, mass)
+and the generation histogram in (gen, mass), note [7], the waiting-law
+accumulators of note [14], the counters of both removal channels, and the
+bookkeeping residuals `mass_drift`, `siphon_spow_drift`, `gen_overflow`
+and `honest_num`/`honest_mass`.
+
+`meta` records the configuration in full: process, system, kernel name and
+its homogeneity degree lambda, the initial condition, the boundary
+settings, the locality ratio actually in force and the number of banded
+bins, the split width and both age rules, gen_max, the particle weight and
+volume, the clock and injection schemes as text, the gate settings, and
+the stop reason.
+
+The final state -- masses, generations, generation times and injection
+times -- is what `state_of` extracts and `ic={'state': ...}` consumes,
+note [15].  `save_run` and `load_run` write and read the whole dict.
+
+
+----------------------------------------------------------------------
+[21] BUILT-IN CHECKS
+----------------------------------------------------------------------
+
+The engine raises rather than continues when an assumption it relies on
+is violated.  The checks, and what each one catches:
+
+  K_ij <= fmaj_ij, every trial.  Catches an invalid majorant, note [2],
+  which would otherwise bias the acceptance silently.
+
+  m <= m_bound for the distributed sink, every draw.  The same check for
+  the removal channel, note [16].
+
+  `mass_drift`, the residual of M_sys = M_ref + M_in - (M_out + M_siphon).
+  Identically zero at w = 1, note [9], so any nonzero value is a
+  bookkeeping bug.
+
+  `siphon_spow_drift`, the relative discrepancy between the incrementally
+  maintained S_pow and its direct recomputation, note [16i].
+
+  `gen_overflow`, the number of particles above gen_max, note [7].  A
+  nonzero count means the tail of the generation distribution is folded
+  into the last bin and the linearity test is invalid there.
+
+  `max_stall_tries`, the number of majorant attempts without an accepted
+  event.  Catches a collapsed acceptance, which usually means a badly
+  chosen grid or a locality band that has removed nearly everything,
+  notes [2] and [17].
+
+  Argument validation at entry: process, system, both age rules, gen_max,
+  the split half-width, and the combinations that do not exist -- a sink
+  gate in a closed system, an open system without injection or without an
+  absorbing boundary.
+
+
+----------------------------------------------------------------------
+FAILURE MAP: WHICH SYMPTOM POINTS AT WHICH NOTE
+----------------------------------------------------------------------
+
+The effects above produce overlapping fingerprints.
+
+  alpha -> -2 for every kernel
+        clock advanced per event instead of per trial ............ [5iv]
+        non-local interaction rule, f = 0 .......................... [8]
+        (the two are indistinguishable from the spectrum alone; check
+         the acceptance and the value of the locality ratio)
+
+  alpha shifted, spectrum visibly combed
+        split half-width below about 0.25 ......................... [11]
+
+  alpha clean, plateau finder reports a tight one-decade plateau on a
+  CLOSED run that is nonetheless wrong
+        snapshot placement 'events' ............................... [10]
+
+  an age class as wide as the whole inertial range, whatever the age
+  rule is set to (median age equal to maximum age under 'inherit')
+        expected: an age class is an ensemble, not a path ........... [7]
+
+  a generation histogram with everything in gen = 0
+        the population has not been ground yet, or the run is shorter
+        than one waiting time at m_inj; with a locality ratio > 0 a body
+        at the top has few partners of comparable mass ....... [7], [17]
+
+  <x> or Var(x) not linear in gen, through the origin
+        the splits are correlated, or gen_max is clipping and the tail
+        is folded into the last bin; check gen_overflow ............. [7]
+
+  alpha clean but b too low
+        the growth-law fit window reaches into the shelf near m_inj,
+        where <m>(tau) has not left the injection mass.  Fit the plateau
+        in dlog<m>/dlog tau rather than reusing the spectrum's guard
+        band ...................................................... [14]
+
+  alpha too shallow AND b too low AND the last mass bin rising
+        pile-up at the top of the grid ............................ [18]
+
+  the distributed sink is on and alpha moved, but not by delta0
+        check nu = omega + 1 - beta.  Only nu = 0 displaces the index;
+        at s*nu > 0 the spectrum keeps its lossless slope and grows a
+        stretched-exponential cutoff, and a fit reaching into that
+        cutoff reports a spurious shift ........................... [16]
+
+  the distributed sink is on and the run crawls, channel acceptance far
+  below one
+        the rejection bound is far outside the live population; read
+        out["siphon_acceptance"] and out["siphon_m_bound"] ......... [16]
+
+  M_out/M_in flattens well below 1 while mass_drift is still zero
+        nothing is lost; the sink mass is missing from the criterion.
+        Use M_removed = M_out + M_siphon .......................... [16]
+
+  the run never stops, or the isochrones never start accumulating
+        gate_counts_siphon is off with a strong distributed sink ... [16]
+
+  out["siphon_spow_drift"] far above 1e-8
+        a mass change somewhere does not update S_pow.  This is a bug,
+        not a statistical excursion ............................... [16]
+
+
+----------------------------------------------------------------------
+ANALYTIC PREDICTIONS THE ENGINE IS BUILT TO MEASURE
+----------------------------------------------------------------------
+
+With kernel homogeneity K(a m1, a m2) = a^lambda K(m1,m2), and
+
+    dm0/dtau  ~  m0^beta                        (drift)
+    m0        ~  tau^b,   b = 1/(1-beta)        (growth)
+    F(m)      ~  m^alpha, alpha = -(1+beta)     (spectrum)
+
+  CLOSED (packet amplitude ~ m0^-2, mass conserving):
+      beta = lambda,         b = 1/(1-lambda),  alpha = -(1+lambda)
+
+  OPEN (background amplitude ~ m0^alpha, self-consistent):
+      beta = (1+lambda)/2,   b = 2/(1-lambda),  alpha = -(3+lambda)/2
+
+Fragmentation gives the same beta and the same alpha; only the sign of
+the drift flips, so m0 ~ (tau_* - tau)^b instead of tau^b.
+
+Both branches meet at lambda = 1 (beta = 1), where the drift becomes
+exponential and alpha = -2.  That point is simultaneously the gelation
+threshold and the only case in which closed and open agree.
+
+    constant kernel,  lambda = 0  : closed alpha = -1,    b = 1
+                                    open   alpha = -3/2,  b = 2
+    geometric kernel, lambda = 2/3: closed alpha = -5/3,  b = 3
+                                    open   alpha = -11/6, b = 6
+
+PRECISION OF b.  Writing n(m) ~ m^-tau with tau = -alpha, the mass
+integral in an open run is set by the upper cut-off, so b = 1/(2-tau) and
+db/dtau = 1/(2-tau)^2.  For the geometric kernel 2 - tau = 1/6, hence
+db/dtau = 36: a one per cent error in alpha moves b by a full unit.
+Quote b to at most two significant figures, and check alpha to three
+decimals before reading a discrepancy in b as physics.
+
+SCOPE.  These predictions describe the INERTIAL RANGE only -- not the
+neighbourhoods of the injection scale or the sink -- and assume pure
+coagulation or pure fragmentation, never a mixture.  For fragmentation
+they require a disruption threshold f > 0, note [8]; alpha is then
+independent of f.
+
+WITH A DISTRIBUTED SINK, note [16].  Write the drift as v_m = s D m^beta,
+with s = +1 for coagulation and s = -1 for fragmentation, and the removal
+as xi(m) = xi0 m^omega.  The family is governed by one exponent and one
+number,
+
+    nu = omega + 1 - beta,        delta0 = xi0/D,
+
+with delta(m) = xi(m) tau_drift(m) = delta0 m^nu the fraction of a cohort
+lost while the drift carries its scale up by a factor e.  A spectrum with
+no intrinsic scale requires that fraction to have no scale either, i.e.
+nu = 0.  Three regimes, distinguished by sign(s*nu):
+
+  nu = 0, i.e. omega = beta - 1.  The removal is scale-matched to the
+  drift, the cohort weight is a pure power, and the index is displaced by
+  exactly delta0:
+
+      p = 1 + beta + s*delta0,
+          coagulation   p = 1 + beta + delta0   (steeper)
+          fragmentation p = 1 + beta - delta0   (flatter)
+
+  with dN/dm ~ m^-p, i.e. alpha = -p.  alpha then moves linearly in
+  delta0, with slope one, and without the b^2 amplification.
+
+  s*nu > 0.  The loss outruns the drift.  The index does not move; the
+  spectrum keeps m^-(1+beta) and acquires a cutoff,
+
+      dN/dm ~ m^-(1+beta) exp[-(s delta0/nu) m^nu].
+
+  Below the cutoff the spectrum is exactly the lossless one.
+
+  s*nu < 0.  The drift outruns the loss.  A finite fraction of each
+  cohort is removed within a bounded interval of ln m near injection, the
+  removal is absorbed into the normalisation, and the index is again the
+  lossless p = 1 + beta.
+
+nu decides WHETHER the index moves, s decides WHICH WAY.  The exponential
+drift is the point omega = 0, beta = 1 of this family, where the sink may
+be mass-independent because nu = 0 is then satisfied by omega = 0.
+
+For the geometric kernel, open: beta = 5/6, so the marginal line is
+omega = -1/6, and alpha reads -11/6 + delta0 in fragmentation.
+
+WHAT DEPENDS ON WHAT.  alpha is a property of the steady-state spectrum
+and is untouched by age bookkeeping; `age_rule` and `frag_age_rule`
+cannot move it.  b is a property of a trajectory and depends on the age
+rule.  The two are linked only through the closure above, so a
+disagreement between them is information about the closure or about the
+fit window, and not automatically an error in either.

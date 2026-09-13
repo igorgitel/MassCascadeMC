@@ -1,0 +1,19 @@
+# Output of the long runs: eight state files of ~11 MB per checkpoint, plus
+# their figures.  Never in the history -- they are reproducible and enormous.
+runs/
+
+# Caches
+__pycache__/
+*.pyc
+
+# Half-written figures, if a save was interrupted
+*.tmp.png
+
+# Arrays written by the examples for re-analysis.  The figures they came with
+# ARE tracked: the README shows them.
+*.npz
+
+# Windows / OneDrive leftovers
+desktop.ini
+Thumbs.db
+~$*
