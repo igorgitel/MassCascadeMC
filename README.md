@@ -5,7 +5,7 @@ break into smaller ones, over many decades of mass. Coagulation and
 fragmentation, in a closed box or with a source and a sink, all from one code
 path.
 
-![open cascade](examples/figures/ex2_open_steady.png)
+<img src="examples/figures/ex2_open_steady.png" alt="open cascade" width="340">
 
 One simulated particle is one real particle. There is no resampling and no
 variable weights, so the total mass is conserved exactly and the reported
@@ -81,19 +81,19 @@ Between them the four cover three different predictions — `-1`, `-11/6` and
 
 ### 1. Closed coagulation
 
-![closed cascade](examples/figures/ex1_closed_selfsimilar.png)
+<img src="examples/figures/ex1_closed_selfsimilar.png" alt="closed cascade" width="340">
 
 A million bodies of mass 1 merge until a thousand are left. Nothing enters and
 nothing leaves, so the spectrum never settles: it just walks towards larger
 masses. The figure shows one snapshot per decade of mean mass.
 
-![the clock](examples/figures/ex1_closed_clock.png)
+<img src="examples/figures/ex1_closed_clock.png" alt="the clock" width="340">
 
 The clock is checked against Smoluchowski's exact solution, which for this
 kernel is a straight line on linear axes. If the mean mass came out exponential
 instead, it would mean the particle weights had dropped out of the time step.
 
-![closed spectrum](examples/figures/ex1_closed_spectrum.png)
+<img src="examples/figures/ex1_closed_spectrum.png" alt="closed spectrum" width="340">
 
 A closed box has no steady spectrum, but it does have one integrated over time,
 and that is the measurement. For this kernel the answer is known exactly:
@@ -129,7 +129,7 @@ and a half. The window is the one the long runs use.
 
 ### 3. Open fragmentation
 
-![fragmentation](examples/figures/ex3_fragmentation_spectrum.png)
+<img src="examples/figures/ex3_fragmentation_spectrum.png" alt="fragmentation" width="340">
 
 The same thing in reverse: whole bodies enter at `m = 1`, break up on the way
 down, and leave at `m = 1e-4`. The constant-flux argument does not care which
@@ -137,7 +137,7 @@ direction the cascade runs, so the prediction is again `-11/6`. Two different
 processes, opposite directions, one exponent — that is the claim, and this pair
 of examples is the test of it.
 
-![generations](examples/figures/ex3_fragmentation_generations.png)
+<img src="examples/figures/ex3_fragmentation_generations.png" alt="generations" width="700">
 
 The second figure shows where the power law comes from. Every particle carries
 the number of breakups between it and the body that entered, and each such
@@ -150,7 +150,7 @@ logarithm of mass is `1/m` in mass.
 
 ### 4. Closed fragmentation
 
-![closed fragmentation](examples/figures/ex4_closed_fragmentation_spectrum.png)
+<img src="examples/figures/ex4_closed_fragmentation_spectrum.png" alt="closed fragmentation" width="340">
 
 A hundred bodies break up inside a closed box until the mean mass reaches a
 floor, below which nothing breaks further. No source, no sink, so the
