@@ -232,8 +232,7 @@ remain consistent.
                     dm0/dt ~ m0   (beta = 1),
 
       and the constant-flux argument then returns alpha = -2 for every
-      kernel.  This is a purely numerical route to the same -2
-      fingerprint that note [8] produces physically.
+      kernel.
 
   (v) DETERMINISTIC MEAN-RATE CLOCK.
 
@@ -441,9 +440,6 @@ The consequences are physical rather than merely numerical:
   - the drift becomes proportional to m0,  dm0/dtau ~ -C m0;
   - beta -> 1 and the measured spectrum approaches alpha = -2
     independently of the intended kernel.
-
-Such an apparent "universal" -2 spectrum is a boundary-dominated
-non-local solution, not the local constant-flux solution.
 
 The physical remedy is analogous to the catastrophic-disruption threshold
 used by Dohnanyi (1969): a sufficiently small projectile cannot

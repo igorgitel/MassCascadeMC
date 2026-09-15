@@ -3,9 +3,8 @@ ex3 -- open fragmentation, geometric kernel.
 
 Whole bodies enter at m = 1, shatter downward, and leave at m = 1e-4.  The
 constant-flux argument does not care which way the cascade runs, so the
-prediction is the same -11/6 as in ex2, quoted against -2 in the same way.
-Two processes, opposite directions, one exponent -- that is the claim these
-two examples test.
+prediction is the same -11/6 as in ex2.  Two processes, opposite directions,
+one exponent.
 
 The second figure says where the power law comes from.  Every particle carries
 the number of splits behind it, and each generation is a packet in ln m that
@@ -185,7 +184,7 @@ def spectrum_figure(run, path):
         print("                    chi2/dof >> 1: the window is not one power law,")
         print("                    so +-%.4f is not an uncertainty" % fit["sigma_p"])
     print("  QUOTED            alpha = %+.4f +- %.4f   (%s)" % (a_q, s_q, src))
-    print("  distance to -2    %+.4f = %.0f sigma"
+    print("  offset from -2    %+.4f = %.0f sigma"
           % (a_q + 2.0, abs(a_q + 2.0) / max(s_q, 1e-12)))
 
     fig, axs = plt.subplots(2, 1, figsize=(COL1, 1.55 * COL1), sharex=True,
@@ -193,10 +192,11 @@ def spectrum_figure(run, path):
 
     an.plot_spectrum(axs[0], run, spec=spec, plateau=plateau, compensate=True)
     xr = np.logspace(np.log10(band[0]) - 0.35, np.log10(band[1]) + 0.35, 40)
-    for a_ref, ls, col, lab in ((PRED["alpha"], "--", "C0", r"$-11/6$, the prediction"),
-                                (-2.0, ":", "0.35", r"$-2$, the artifact")):
-        A = an.anchor_amplitude(c, spec["F"], band[0], band[1], a_ref)
-        axs[0].plot(xr, A * xr ** (a_ref + 2.0), ls, lw=1.0, color=col, label=lab)
+    A = an.anchor_amplitude(c, spec["F"], band[0], band[1], PRED["alpha"])
+    axs[0].plot(xr, A * xr ** (PRED["alpha"] + 2.0), "--", lw=1.0, color="C0",
+                label=r"$-11/6$, the prediction")
+    A2 = an.anchor_amplitude(c, spec["F"], band[0], band[1], -2.0)
+    axs[0].plot(xr, A2 * np.ones_like(xr), ":", lw=1.0, color="0.35")
     an.compensated_ylim(axs[0], c, spec["F"])
     axs[0].set_ylabel(r"$m^{2}\,dN/dm$")
     axs[0].text(0.03, 0.96,
@@ -211,7 +211,6 @@ def spectrum_figure(run, path):
     axs[1].axhline(PRED["alpha"], ls="--", lw=1.0, color="C0")
     axs[1].axhline(-2.0, ls=":", lw=1.0, color="0.35")
     axs[1].text(band[0] * 1.1, PRED["alpha"] + 0.05, r"$-11/6$", color="C0", fontsize=6.5)
-    axs[1].text(band[0] * 1.1, -1.97, r"$-2$", color="0.35", fontsize=6.5)
     axs[1].set_ylim(-2.45, -1.35)
     axs[1].set_xlabel(r"mass $m$")
     axs[1].set_ylabel(r"$d\log F/d\log m$")

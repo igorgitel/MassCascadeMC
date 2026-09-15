@@ -10,9 +10,10 @@ spectrum.
 The last one is the measurement.  A closed box has no steady spectrum, but
 the age integral of it is a power law with alpha = -1, and for this kernel
 that is known exactly rather than argued.  Below m = 4 the histogram reads
--2 instead, which is not physics: masses are whole multiples of the initial
-one, so a narrow log bin holds one line or none, and dividing that line by a
-width that grows with m turns 1/k into 1/m^2.  The fit starts above it.
+-2 instead, for a reason that is in the binning rather than the physics:
+masses are whole multiples of the initial one, so a narrow log bin holds one
+line or none, and dividing that line by a width that grows with m turns 1/k
+into 1/m^2.  The fit starts above it.
 
 Runtime: about forty seconds.  N0 and MAX_EVENTS are the knobs.
 """
@@ -119,7 +120,7 @@ def picket_fence_mass():
     one line only above M_INIT/(10^dex - 1).  Below that, a bin holds one line
     or none, and the density divides the line by a width that grows with m:
     n_k ~ 1/k becomes F ~ 1/m^2.  That is where the -2 at the bottom of the
-    figure comes from -- the artifact value, manufactured by binning alone.
+    figure comes from, manufactured by binning alone.
     Finer bins push the threshold UP, which is the opposite of the usual
     instinct.
     """
@@ -245,7 +246,7 @@ def spectrum_figure(run, m_top, path):
         print("                    chi2/dof >> 1: the window is not one power law,")
         print("                    so +-%.4f is not an uncertainty" % fit["sigma_p"])
     print("  QUOTED            alpha = %+.4f +- %.4f   (%s)" % (a_q, s_q, src))
-    print("  distance to -2    %+.4f = %.0f sigma"
+    print("  offset from -2    %+.4f = %.0f sigma"
           % (a_q + 2.0, abs(a_q + 2.0) / max(s_q, 1e-12)))
 
     fig, axs = plt.subplots(2, 1, figsize=(COL1, 1.55 * COL1), sharex=True,
@@ -253,10 +254,11 @@ def spectrum_figure(run, m_top, path):
 
     an.plot_spectrum(axs[0], run, spec=spec, plateau=plateau, compensate=True)
     xr = np.logspace(np.log10(band[0]) - 0.35, np.log10(band[1]) + 0.35, 40)
-    for a_ref, ls, col, lab in ((PRED["alpha"], "--", "C0", r"$-1$, the prediction"),
-                                (-2.0, ":", "0.35", r"$-2$, the artifact")):
-        A = an.anchor_amplitude(c, spec["F"], band[0], band[1], a_ref)
-        axs[0].plot(xr, A * xr ** (a_ref + 2.0), ls, lw=1.0, color=col, label=lab)
+    A = an.anchor_amplitude(c, spec["F"], band[0], band[1], PRED["alpha"])
+    axs[0].plot(xr, A * xr ** (PRED["alpha"] + 2.0), "--", lw=1.0, color="C0",
+                label=r"$-1$, the prediction")
+    A2 = an.anchor_amplitude(c, spec["F"], band[0], band[1], -2.0)
+    axs[0].plot(xr, A2 * np.ones_like(xr), ":", lw=1.0, color="0.35")
     an.compensated_ylim(axs[0], c, spec["F"])
     axs[0].set_ylabel(r"$m^{2}\int (dN/dm)\,dt$")
     axs[0].text(0.03, 0.96,
@@ -270,7 +272,6 @@ def spectrum_figure(run, m_top, path):
     axs[1].axhline(PRED["alpha"], ls="--", lw=1.0, color="C0")
     axs[1].axhline(-2.0, ls=":", lw=1.0, color="0.35")
     axs[1].text(band[0] * 1.1, PRED["alpha"] + 0.06, r"$-1$", color="C0", fontsize=6.5)
-    axs[1].text(band[0] * 1.1, -1.94, r"$-2$", color="0.35", fontsize=6.5)
     axs[1].set_ylim(-2.6, -0.4)
     axs[1].set_xlabel(r"mass $m$")
     axs[1].set_ylabel(r"$d\log F/d\log m$")

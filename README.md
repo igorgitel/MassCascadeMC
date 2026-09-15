@@ -28,22 +28,33 @@ edges of the mass range. An open system can have a source that injects bodies at
 a fixed mass and rate, an absorbing wall at one end, and a distributed sink that
 removes bodies everywhere at a mass-dependent rate.
 
-## The number that matters
+## What is measured
 
-For a kernel with homogeneity degree `lambda`, the predicted spectrum in an open
-box is
+The engine integrates a mass cascade with the collisional kernel `K = sigma v`,
+homogeneous of degree `lambda`. Two configurations, two predictions.
+
+**Closed.** Nothing enters and nothing leaves, and the total mass is conserved
+exactly. There is no steady spectrum: the characteristic scale grows
+self-similarly, `s' ~ s^lambda`, so a scale near `m` is occupied for a residence
+time `dt ~ m^(1-lambda)`, during which the mass per decade there is of order the
+total `M`. The time-integrated spectrum follows from `m^2 N(m) ~ M dt`:
+
+```
+alpha = -(1 + lambda)
+```
+
+**Open.** Bodies enter at one end and leave at the other, and the cascade
+carries a constant flux in mass space, `J ~ m^(3+lambda) n^2 = const`
+(Kolmogorov-Zakharov):
 
 ```
 alpha = -(3 + lambda)/2
 ```
 
-which is `-11/6` for the geometric cross section used here. That it is **not**
-`-2` is the whole point. Two ways of getting the simulation wrong — advancing
-the clock once per event instead of once per attempt, and letting any small body
-break any large one — both give `-2` for every kernel. With the additive kernel
-the correct answer is also `-2`, so those mistakes are invisible. Here they are
-not: a run that returns `-2` has failed, and every figure draws `-2` as a dotted
-line for exactly that reason.
+which is `-11/6` for the geometric cross section used here.
+
+Each example measures one of these against its analytic value; the four cover
+`-1`, `-5/3` and `-11/6`.
 
 ## Files
 
@@ -77,7 +88,7 @@ where the spectrum, the generations and the settling test all have to hold at
 the same time. `MAX_EVENTS` at the top of each file is the dial.
 
 Between them the four cover three different predictions — `-1`, `-11/6` and
-`-5/3` — all measured against the same wrong answer of `-2`.
+`-5/3` — each against its own analytic value.
 
 ### 1. Closed coagulation
 
@@ -101,9 +112,9 @@ and that is the measurement. For this kernel the answer is known exactly:
 understanding — every mass here is a whole multiple of the starting mass, so at
 small masses the spectrum is a set of separate lines. A narrow logarithmic bin
 holds one line or none, and dividing that one line by a bin width that grows
-with mass turns `1/k` into `1/m^2`. It is the wrong answer manufactured by the
-binning alone, with nothing wrong in the physics, and finer bins make it worse
-rather than better. The fit starts above it.
+with mass turns `1/k` into `1/m^2`. That value is manufactured by the binning
+alone, with nothing wrong in the physics, and finer bins make it worse rather
+than better. The fit starts above it.
 
 ### 2. Open coagulation
 
@@ -134,8 +145,7 @@ and a half. The window is the one the long runs use.
 The same thing in reverse: whole bodies enter at `m = 1`, break up on the way
 down, and leave at `m = 1e-4`. The constant-flux argument does not care which
 direction the cascade runs, so the prediction is again `-11/6`. Two different
-processes, opposite directions, one exponent — that is the claim, and this pair
-of examples is the test of it.
+processes, opposite directions, one exponent.
 
 <img src="examples/figures/ex3_fragmentation_generations.png" alt="generations" width="700">
 
