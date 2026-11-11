@@ -1,5 +1,3 @@
-# The engine needs numpy alone.  The analysis layer and the examples also need
-# matplotlib.  Both bounds are the oldest versions the code is known to run on,
-# not the newest it was tested with.
+# numpy for the engine; matplotlib for the analysis layer and the runs.
 numpy>=1.24
 matplotlib>=3.6

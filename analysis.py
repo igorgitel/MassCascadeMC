@@ -1,71 +1,11 @@
 """
-BF_analysis.py  --  the measurement layer
-
-The simulation engine, masscascade.py, produces arrays.  Turning those
-arrays into a number is a separate job with its own failure modes, and this module
-is that job in one place: loading a saved run, choosing the estimator, attaching an
-uncertainty to it, finding the range over which a power law actually holds, and
-propagating the counting error all the way through to the growth exponent.
-
-NOTHING HERE TOUCHES THE ENGINE.  Every uncertainty below is reconstructed from what
-`simulate` already stores, so no run has to be repeated and `simulate` itself needs
-no change.  That is possible because `dndm` and `iso_counts` are both linear
-rescalings of raw particle counts, and the scale factors are recorded in `meta`:
-
-    dndm[k,b]      = n[k,b] * (w/V) / widths[b]        ->  n = dndm * widths * V / w
-    iso_counts[a,b] = (raw counts) * w                 ->  n = iso_counts / w
-
-----------------------------------------------------------------------
-TWO ERRORS, AND WHY BOTH ARE REPORTED
-----------------------------------------------------------------------
-The Poisson error, sigma/F = 1/sqrt(C) with C the total counts, is a FLOOR.  It is
-what you would get if every snapshot were an independent draw and the only noise
-were counting noise.
-
-The empirical error, the scatter of dndm across snapshots divided by sqrt(K_eff), is
-what you actually have.  It needs no distributional assumption and it automatically
-contains everything Poisson misses: that consecutive snapshots share particles, that
-the population itself fluctuates, that the steady state is only statistically steady.
-
-K_eff is the number of INDEPENDENT snapshots, estimated from the lag-1
-autocorrelation as K (1-rho)/(1+rho).  Using K instead of K_eff is the standard way
-to under-report an error bar by a factor of a few.
-
-The two are returned side by side.  When the empirical error sits at the Poisson
-floor the sampling is as good as counting allows; when it sits far above, the run is
-telling you that the snapshots are correlated or the state is drifting.
-
-----------------------------------------------------------------------
-FROM THE SPECTRUM TO b
-----------------------------------------------------------------------
-The chain is short and every link is exact:
-
-  1. counts in an (age, mass) cell        c_ab            Poisson, sigma = sqrt(c)
-  2. mean mass of an isochrone            <m>_a = S1/S0   S1 = sum_b c_ab m_b
-                                                          S0 = sum_b c_ab
-     d<m>/dc_b = (m_b - <m>)/S0, so
-        var(<m>) = sum_b c_b (m_b - <m>)^2 / S0^2
-     which is exactly the standard error of the mean, sigma_m / sqrt(S0), with
-     sigma_m the spread of masses inside that isochrone.
-  3. a particle is counted once per snapshot it survives in its age bin, so S0
-     counts APPEARANCES, not independent particles.  The correction is
-        N_eff = S0 / n_rep,     n_rep = age-bin width / snapshot spacing,
-     clipped at 1.  Skipping it is the second standard way to under-report.
-  4. b from a WEIGHTED least squares of ln<m> against ln tau, which returns
-     sigma_b analytically together with chi2/dof.
-
-chi2/dof is the useful part.  It is near one when a single power law describes the
-window and blows up when the window has swallowed the crossover at m_inj or the
-truncation at m_sink -- which makes it an objective test of the fitting range
-instead of an argument about it.
+analysis.py -- measurement layer: spectral index with its uncertainty,
+power-law range, generation and age statistics, settling tests.
+Works on what `simulate` returns; it never calls the engine.
 """
 
 import numpy as np
 
-# The analysis helpers below (local_slope, find_inertial_range, save_run, ...) are
-# identical in every engine, so take whichever is on the path -- newest first.
-# Newest engine first.  A notebook therefore imports ONE module and gets whichever
-# engine is actually present; `ENGINE_NAME` below says which one answered.
 BF = None
 for _engine_name in ("masscascade", "BF_warm_start_v7", "BF_warm_start_v6", "BF_warm_start_v5", "BF_v_no_resampling_v4",
                      "BF_v_no_resampling_v3", "BF_v_no_resampling_v2"):
@@ -77,32 +17,21 @@ for _engine_name in ("masscascade", "BF_warm_start_v7", "BF_warm_start_v6", "BF_
 if BF is None:
     raise ImportError("no Majorant_v2 engine found on the path")
 
-# Re-exported from the engine so a notebook imports ONE module.  These are the
-# analysis helpers that live there for historical reasons; they are unchanged.
 local_slope         = BF.local_slope
 find_inertial_range = BF.find_inertial_range
 guard_band          = BF.guard_band
 fit_powerlaw        = BF.fit_powerlaw
 superpose           = BF.superpose
 predict             = BF.predict
-iso_mean_mass_raw   = BF.iso_mean_mass      # counts-only version, no error bar
+iso_mean_mass_raw   = BF.iso_mean_mass
 growth_fit          = BF.growth_fit
-# [v5] present only on the warm-start engine; None on v2/v3/v4 so a notebook can
-# test for them instead of failing on import.
 sample_powerlaw     = getattr(BF, "sample_powerlaw", None)
 steady_N_for_mass   = getattr(BF, "steady_N_for_mass", None)
 ENGINE_NAME         = getattr(BF, "__name__", "?")
 
-
-# ======================================================================
-#  LOADING
-# ======================================================================
-
 def load(path):
-    """Read a run written by add_last_run.  Thin wrapper, kept so notebooks import
-    one module rather than two."""
+    """Read a run written by add_last_run."""
     return BF.load_run(path)
-
 
 def describe(run, name=""):
     """One block of text: configuration, cost, what was stored alongside."""
@@ -121,9 +50,6 @@ def describe(run, name=""):
               float(run["mass_drift"])),
            "  %-16s %d snapshots, %d mass bins"
            % ("arrays", np.asarray(run["dndm"]).shape[0], np.asarray(run["centers"]).size)]
-    # [v5] a warm start must announce itself: every statement about ancestry on
-    # such a run is conditional on the honest fraction, and every statement
-    # about alpha is conditional on the seed having been the WRONG slope.
     if m.get("seeded"):
         s = m.get("seed") or {}
         out.append("  %-16s alpha = %+.4f on [%.3g, %.3g], N = %s, <m> = %.4g"
@@ -137,9 +63,6 @@ def describe(run, name=""):
         out.append("  %-16s %.4g stays closed in %d bins"
                    % ("waiting law", float(np.asarray(run["wait_events"]).sum()),
                       int((np.asarray(run["wait_events"]) > 0).sum())))
-    # [v5] PROVENANCE.  Restarts compose, and a month later alpha alone will not
-    # recover which checkpoint the run grew from, nor how much physical time the
-    # box had already lived through before it.
     if m.get("restarted_from"):
         out.append("  %-16s %s" % ("RESTARTED FROM", m["restarted_from"]))
         out.append("  %-16s %.4g before this run + %.4g in it = %.4g in total"
@@ -159,11 +82,6 @@ def describe(run, name=""):
             out.append("      %-22s %s" % (k, ("%+.4g" % v) if isinstance(v, float) else v))
     return "\n".join(out)
 
-
-# ======================================================================
-#  RAW COUNTS  --  the thing every error bar is built from
-# ======================================================================
-
 def scale_factors(run):
     """(w, V, widths): everything needed to go between dndm and raw counts."""
     m = run["meta"]
@@ -171,36 +89,13 @@ def scale_factors(run):
     V = float(m.get("volume", 1.0))
     return w, V, np.asarray(run["widths"], float)
 
-
 def raw_counts(run):
-    """
-    Particle counts per (snapshot, mass bin), recovered from dndm.
-
-    dndm = n * (w/V) / width, so n = dndm * width * V / w.  Exact, not an estimate:
-    the engine stores the rescaled histogram and the scale is in meta.
-    """
+    """Particle counts per (snapshot, mass bin), recovered from dndm."""
     w, V, widths = scale_factors(run)
     return np.asarray(run["dndm"], float) * widths[None, :] * V / w
 
-
 def steady_mask(run, frac=0.5, verbose=False):
-    """
-    Which snapshots belong to the steady state.
-
-    THE CRITERION IS THE SINK COUNTER, `n_out`, which is recorded per snapshot: the
-    gate fires once the cascade has demonstrably delivered particles across the whole
-    inertial range, and that is exactly the point after which the run is stationary.
-
-    It is deliberately NOT the gate TIME.  A run with zero_time_at_tracer_start
-    reports t measured from the gate, so t is negative through the fill -- and a
-    stored gate time written on the old clock then lies outside the t array entirely,
-    every snapshot fails the test, and the estimator silently falls back to averaging
-    ONE snapshot.  That happened: a six-decade run with 202 snapshots, 184 of them
-    past the gate, was reduced to K = 1.  A counter cannot be shifted, so it cannot
-    fail that way.
-
-    Falls back to the gate time, then to the last `frac` of the run, and says so.
-    """
+    """Which snapshots belong to the steady state."""
     t = np.asarray(run["t"], float)
     meta = run.get("meta", {})
     gate = float(meta.get("iso_start_sink", 0) or 0)
@@ -226,14 +121,8 @@ def steady_mask(run, frac=0.5, verbose=False):
         ss[-1] = True
     return ss
 
-
 def effective_snapshots(series):
-    """
-    Number of INDEPENDENT samples in a correlated series, K (1-rho)/(1+rho).
-
-    Consecutive snapshots share particles, so the naive K over-states the averaging.
-    rho is the lag-1 autocorrelation; rho = 0 gives K back, rho -> 1 gives 1.
-    """
+    """Number of INDEPENDENT samples in a correlated series, K (1-rho)/(1+rho)."""
     x = np.asarray(series, float)
     x = x[np.isfinite(x)]
     K = x.size
@@ -247,28 +136,8 @@ def effective_snapshots(series):
     rho = min(max(rho, 0.0), 0.98)
     return float(np.clip(K * (1.0 - rho) / (1.0 + rho), 1.0, K))
 
-
-# ======================================================================
-#  THE SPECTRUM, WITH AN ERROR BAR
-# ======================================================================
-
 def steady_spectrum(run, frac=0.5, verbose=False):
-    """
-    The estimator for an OPEN run and its uncertainty.
-
-    The steady state IS the instantaneous spectrum, so dt never enters and every
-    post-gate snapshot is a draw from the same distribution.  Averaging them is free
-    -- they are already in the file -- and this returns the average together with
-    both error estimates.
-
-    Returns a dict:
-        F          averaged dN/dm
-        sigma      the error bar to plot: empirical, floored at Poisson
-        sigma_emp  scatter across snapshots / sqrt(K_eff)
-        sigma_pois F / sqrt(total counts)
-        counts     total raw counts per bin over the averaged snapshots
-        K, K_eff   snapshots averaged, and how many of them were independent
-    """
+    """The estimator for an OPEN run and its uncertainty."""
     D = np.asarray(run["dndm"], float)
     n = raw_counts(run)
     ss = steady_mask(run, frac=frac, verbose=verbose)
@@ -276,13 +145,12 @@ def steady_spectrum(run, frac=0.5, verbose=False):
     K = int(ss.sum())
 
     F = Ds.mean(axis=0)
-    C = ns.sum(axis=0)                                   # total counts per bin
+    C = ns.sum(axis=0)
 
     with np.errstate(divide="ignore", invalid="ignore"):
         sigma_pois = np.where(C > 0, F / np.sqrt(np.maximum(C, 1e-300)), np.nan)
 
     if K >= 4:
-        # one K_eff per bin: correlation is not the same at the top and the bottom
         Keff = np.array([effective_snapshots(Ds[:, b]) for b in range(Ds.shape[1])])
         sigma_emp = Ds.std(axis=0, ddof=1) / np.sqrt(np.maximum(Keff, 1.0))
     else:
@@ -297,15 +165,11 @@ def steady_spectrum(run, frac=0.5, verbose=False):
     return dict(F=F, sigma=sigma, sigma_emp=sigma_emp, sigma_pois=sigma_pois,
                 counts=C, K=K, K_eff=Keff, mask=ss)
 
-
 def superposed_spectrum(run):
-    """The CLOSED-system estimator: the dt-weighted superposition.  No steady state
-    exists there, so the observable is the age integral and the snapshot cadence,
-    not the averaging, is what has to be right (see note [10] in the engine)."""
+    """The CLOSED-system estimator: the dt-weighted superposition."""
     F = BF.superpose(run["dndm"], run["t"])
     n = raw_counts(run)
     dt = np.diff(np.asarray(run["t"], float), prepend=float(run["t"][0]))
-    # the weighted sum of Poisson counts: var = sum (dt_k)^2 * n_k, in dndm units
     w, V, widths = scale_factors(run)
     scale = (w / V) / widths
     var = ((dt[:, None] ** 2) * n).sum(axis=0) * scale ** 2
@@ -315,43 +179,16 @@ def superposed_spectrum(run):
                 counts=n.sum(axis=0), K=int(n.shape[0]),
                 K_eff=np.full(F.shape, float(n.shape[0])), mask=np.ones(n.shape[0], bool))
 
-
 def spectrum(run, frac=0.5, verbose=False):
-    """Pick the estimator from the system recorded in meta.  Open -> the averaged
-    instantaneous spectrum; closed -> the superposition."""
+    """Pick the estimator from the system recorded in meta."""
     if run["meta"]["system"] == "open":
         return steady_spectrum(run, frac=frac, verbose=verbose)
     return superposed_spectrum(run)
 
-
-# ======================================================================
-#  ISOCHRONES, WITH AN ERROR BAR
-# ======================================================================
-
 def iso_mean_mass(run, correct_repeats=True, groups=None):
-    """
-    <m>(tau) from the accumulated (age, mass) histogram, with its uncertainty.
-
-    var(<m>) = sum_b c_b (m_b - <m>)^2 / S0^2 -- the standard error of the mean, with
-    the spread taken over the mass distribution inside that isochrone.
-
-    `correct_repeats` divides the counts by how many snapshots a particle spends
-    inside one age bin, because the histogram counts appearances rather than
-    independent particles.  n_rep = (age bin width) / (snapshot spacing), clipped at
-    one.  Without it the error bar is too small by sqrt(n_rep), which here is a
-    factor of a few.
-
-    `groups` merges age bins before anything is computed: a list of index arrays,
-    one per merged isochrone.  The counts of an age bin are accumulated additively
-    by the engine, so summing adjacent bins is not an approximation -- it is exactly
-    the histogram that a coarser `iso_age_edges` would have produced.  That identity
-    is what makes the rebinned growth law a check on the fine-binned one rather than
-    a different measurement: the same particles, resampled in age.
-
-    Returns dict with tau, mbar, sigma, counts, n_rep (and tau_lo, tau_hi).
-    """
+    """<m>(tau) from the accumulated (age, mass) histogram, with its uncertainty."""
     w, V, widths = scale_factors(run)
-    c = np.asarray(run["iso_counts"], float) / w          # raw counts per (age, mass)
+    c = np.asarray(run["iso_counts"], float) / w
     m = np.asarray(run["centers"], float)
     e = np.asarray(run["iso_age_edges"], float)
 
@@ -363,7 +200,7 @@ def iso_mean_mass(run, correct_repeats=True, groups=None):
             nan = np.zeros(0)
             return dict(tau=nan, mbar=nan, sigma=nan, counts=nan, n_rep=nan,
                         tau_lo=nan, tau_hi=nan)
-        c = np.array([c[g].sum(axis=0) for g in groups])   # counts add.  Exactly.
+        c = np.array([c[g].sum(axis=0) for g in groups])
         lo = np.array([e[g.min()] for g in groups])
         hi = np.array([e[g.max() + 1] for g in groups])
     tau = np.sqrt(lo * hi)
@@ -389,19 +226,8 @@ def iso_mean_mass(run, correct_repeats=True, groups=None):
     return dict(tau=tau, mbar=mbar, sigma=sigma, counts=S0, n_rep=n_rep,
                 tau_lo=lo, tau_hi=hi)
 
-
-# ======================================================================
-#  FITTING
-# ======================================================================
-
 def wls_powerlaw(x, y, sy=None, mask=None):
-    """
-    Weighted least squares of ln y against ln x -- i.e. y = A x^p with errors.
-
-    Returns p, its analytic sigma, A, chi2/dof and the number of points.  chi2/dof is
-    the part worth reading: near one the window is described by a single power law,
-    far above one it is not, whatever the correlation coefficient says.
-    """
+    """Weighted least squares of ln y against ln x."""
     x = np.asarray(x, float); y = np.asarray(y, float)
     k = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
     if mask is not None:
@@ -431,19 +257,13 @@ def wls_powerlaw(x, y, sy=None, mask=None):
     chi2_dof = float((W * resid ** 2).sum() / dof)
     rms = float(np.sqrt((resid ** 2).mean()))
     if sy is None:
-        # Unweighted: there is no chi2, only scatter.  Scale sigma by it, and report
-        # the number as nan so nobody reads a goodness-of-fit into it.
         sigma_p *= np.sqrt(chi2_dof)
         chi2_dof = np.nan
     return dict(p=float(p), sigma_p=float(sigma_p), A=float(np.exp(a)),
                 chi2_dof=chi2_dof, rms_resid=rms, n=int(k.sum()))
 
-
 def anchor_amplitude(m, F, m_lo, m_hi, alpha):
-    """A such that A m^alpha passes through the data over [m_lo, m_hi]: the
-    least-squares intercept at FIXED slope, so the drawn line carries the measured
-    index and nothing else, and the theory line drawn the same way differs from it
-    in slope alone."""
+    """A such that A m^alpha passes through the data over [m_lo, m_hi]: the least-squares intercept at FIXED slope, so the drawn line carries the measured index and nothing else, and the theory line drawn the same way differs from it in slope alone."""
     m = np.asarray(m, float); F = np.asarray(F, float)
     if not (np.isfinite(m_lo) and np.isfinite(m_hi) and np.isfinite(alpha)):
         return np.nan
@@ -452,40 +272,15 @@ def anchor_amplitude(m, F, m_lo, m_hi, alpha):
         return np.nan
     return 10.0 ** np.mean(np.log10(F[k]) - alpha * np.log10(m[k]))
 
-
-# ======================================================================
-#  PLATEAUX
-# ======================================================================
-
 def spectrum_plateau(run, half=3, tol=0.30, min_decades=0.8, spec=None):
-    """The inertial range of the spectrum: the longest flat run of
-    d log F / d log m.  Thin wrapper on the engine's finder, so the notebook has one
-    import."""
+    """The inertial range of the spectrum: the longest flat run of d log F / d log m."""
     s = spec if spec is not None else spectrum(run)
     return BF.find_inertial_range(run["centers"], s["F"], half=half, tol=tol,
                                   min_decades=min_decades)
 
-
 def growth_plateau(tau, mbar, counts=None, half=3, tol=0.50, min_bins=5,
                    min_slope=0.30, n_min=1e3):
-    """
-    The self-similar stretch of <m>(tau): the longest flat run of
-    d log<m> / d log tau whose mean is an actual growth rate.
-
-    BF.find_inertial_range cannot be used unmodified here.  It returns the LONGEST
-    flat run, and the longest flat run in <m>(tau) is the dead shelf at <m> = m_inj
-    where the isochrones have not started moving -- sixty bins over three decades of
-    tau at slope zero, against a dozen bins over half a decade for the real thing.
-    It is the same trap as the frozen shelf below min_frag_mass in closed
-    fragmentation.  The single extra condition, |mean slope| >= min_slope, states that
-    a shelf is not a growth law, and rejects it without touching anything real.
-
-    The absolute value is what lets the same finder serve fragmentation, where the
-    isochrones run DOWN in mass and the exponent is negative.  What is being rejected
-    is a rate of zero, not a sign; requiring the mean slope itself to be positive
-    would have returned nothing at all on every fragmentation run and quietly fallen
-    back on drawing every age bin.
-    """
+    """The self-similar stretch of <m>(tau): the longest flat run of d log<m> / d log tau whose mean is an actual growth rate."""
     tau = np.asarray(tau, float); mbar = np.asarray(mbar, float)
     ok = np.isfinite(mbar) & (mbar > 0)
     if counts is not None:
@@ -524,15 +319,8 @@ def growth_plateau(tau, mbar, counts=None, half=3, tol=0.50, min_bins=5,
                 n_bins=int(j - i + 1), tau_lo=float(x[i]), tau_hi=float(x[j]),
                 m_lo=float(y[i]), m_hi=float(y[j]))
 
-
 def growth_law(run, correct_repeats=True, **kw):
-    """
-    The whole chain in one call: counts -> <m>(tau) with sigma -> plateau ->
-    weighted fit -> b with its uncertainty.
-
-    Returns the isochrone dict, the plateau dict and the fit dict, plus the mask of
-    age bins that entered the fit.
-    """
+    """The whole chain in one call: counts -> <m>(tau) with sigma -> plateau -> weighted fit -> b with its uncertainty."""
     iso = iso_mean_mass(run, correct_repeats=correct_repeats)
     pl = growth_plateau(iso["tau"], iso["mbar"], iso["counts"], **kw)
     k = (np.isfinite(iso["mbar"]) & (iso["tau"] >= pl["tau_lo"])
@@ -540,38 +328,9 @@ def growth_law(run, correct_repeats=True, **kw):
     fit = wls_powerlaw(iso["tau"], iso["mbar"], iso["sigma"], mask=k)
     return iso, pl, fit, k
 
-
-# ======================================================================
-#  DRAWING
-# ======================================================================
-
 def iso_groups(run, pl=None, iso=None, n_curves=8, min_counts=1e3,
                inside_plateau=True, correct_repeats=True):
-    """
-    Merge the age bins into a handful of wide ones and return them as index groups.
-
-    Two things go wrong when every age bin is drawn as its own isochrone.  Below one
-    collision time nothing has happened yet, so dozens of bins pile up as identical
-    curves at the injection mass; above the plateau the bins are so thin that the
-    curve is shot noise.  Both are cured by choosing the window from the physics and
-    then widening the bins until each one has something in it.
-
-    The window is the growth-law plateau -- the stretch of ages over which
-    d log<m>/d log tau is flat.  Those are the isochrones that are actually
-    self-similar, so the picture then shows exactly the age bins the exponent was
-    measured on, and nothing else.  Set inside_plateau=False to keep every bin that
-    holds counts.
-
-    The widening is greedy from the young end: a group keeps taking bins until it is
-    at least (span / n_curves) wide in log tau AND holds at least min_counts.  Where
-    counts are plentiful that stops after one or two bins; near the top of the
-    cascade, where they are not, the groups widen on their own.  Merging is exact --
-    see iso_mean_mass -- so nothing is smoothed away that was ever measured; only the
-    age resolution is spent, and it is spent where it was worthless anyway.
-
-    Returns (groups, info) with info.rejected listing the bins left out, so a caller
-    can draw them faintly instead of hiding them.
-    """
+    """Merge the age bins into a handful of wide ones and return them as index groups."""
     empty = dict(rejected=np.array([], int), candidates=np.array([], int),
                  pl=pl, span=0.0, mode="none")
     if "iso_counts" not in run:
@@ -594,12 +353,9 @@ def iso_groups(run, pl=None, iso=None, n_curves=8, min_counts=1e3,
             sel = have[(tau[have] >= pl["tau_lo"]) & (tau[have] <= pl["tau_hi"])]
             if sel.size >= 2:
                 cand, mode = sel, "growth plateau"
-    # A plateau that could not be found is not a reason to draw nothing.
     if cand.size < 2:
         cand, mode = have, "all bins (no plateau found)"
 
-    # widths are measured on the EDGES, so "how wide is this group" is the width of
-    # the age band it actually covers, not the gap between the first and last centre
     span = float(np.log10(e[cand[-1] + 1] / e[cand[0]]))
     target = span / max(int(n_curves), 1) if span > 0 else np.inf
 
@@ -614,7 +370,6 @@ def iso_groups(run, pl=None, iso=None, n_curves=8, min_counts=1e3,
             j += 1
         groups.append(cand[i:j + 1])
         i = j + 1
-    # a starved last group is folded back rather than drawn as noise
     if len(groups) > 1 and cnt[groups[-1]].sum() < min_counts:
         groups[-2] = np.concatenate([groups[-2], groups[-1]])
         groups.pop()
@@ -623,7 +378,6 @@ def iso_groups(run, pl=None, iso=None, n_curves=8, min_counts=1e3,
     info = dict(rejected=np.setdiff1d(have, used), candidates=cand, pl=pl,
                 span=span, mode=mode)
     return groups, info
-
 
 def plateau_line(pl, fit=None, b_theory=None, tag=""):
     """One line stating the window the picture and the fit share, ready to print."""
@@ -639,22 +393,9 @@ def plateau_line(pl, fit=None, b_theory=None, tag=""):
         s += " | theory %.3f" % b_theory
     return s
 
-
 def pick_isochrones(run, n_show=None, mode="plateau", min_frac=1e-4,
                     min_counts=1e3, pl=None, iso=None):
-    """
-    Which isochrones to draw.  Returns (groups, tau, n_candidates), where each group
-    is an array of age-bin indices to be merged into one curve; a group of length one
-    is an ordinary isochrone, so the old (index array) return still works downstream.
-
-    mode='plateau' -- the default -- takes the window from the growth law and widens
-    the bins, which is the only selection here that is not a cosmetic threshold.
-    mode='counts' is the old behaviour with its one bug fixed: it now ranks age bins
-    by how many PARTICLES they hold, not by the sum of dN/dm, which is a sum of
-    densities dominated by the narrow bins at the injection scale and falls twelve
-    orders of magnitude across the age grid where the counts fall four.  That
-    mismatch is what silently discarded the top two decades of the cascade.
-    """
+    """Which isochrones to draw."""
     if "iso_dndm" not in run:
         return [], np.array([]), 0
     e = np.asarray(run["iso_age_edges"], float)
@@ -677,20 +418,9 @@ def pick_isochrones(run, n_show=None, mode="plateau", min_frac=1e-4,
                                               int(n_show)).astype(int))]
     return [np.array([k]) for k in usable], tau, int(usable.size)
 
-
 def draw_isochrones(ax, run, idx, tau, tau_scale=1.0, cbar_label=r"age $\tau$",
                     min_count=3.0, show_rejected=True, rejected=None):
-    """
-    Isochrones coloured by age.  `idx` may be plain bin indices or groups of them; a
-    group is summed, which is what a wider age bin means.  Mass bins holding fewer
-    than min_count particles are blanked, because at the ends of an isochrone the
-    histogram is one or two counts wide and draws a spiky tail that is shot noise.
-
-    The age bins that were NOT selected are drawn faintly rather than dropped.  That
-    matters: the selection is made by the growth-law plateau, and a picture that
-    showed only what the plateau kept would be confirming the window with the window.
-    Drawn in grey underneath, the choice can be argued with.
-    """
+    """Isochrones coloured by age."""
     import matplotlib.pyplot as plt
     from matplotlib.colors import LogNorm
     if len(idx) == 0:
@@ -710,7 +440,7 @@ def draw_isochrones(ax, run, idx, tau, tau_scale=1.0, cbar_label=r"age $\tau$",
             y = dn[k] / nsnp
             ok = (y > 0) & (cnt[k] >= min_count)
             if ok.sum() < 2:
-                continue      # a single populated mass bin draws no line, only clutter
+                continue
             ax.loglog(c, np.where(ok, y * c ** 2, np.nan), lw=.7, alpha=.55,
                       color="0.78", zorder=0)
 
@@ -729,7 +459,6 @@ def draw_isochrones(ax, run, idx, tau, tau_scale=1.0, cbar_label=r"age $\tau$",
     cb = ax.figure.colorbar(sm, ax=ax, pad=.02, fraction=.05)
     cb.set_label(cbar_label, fontsize=7); cb.ax.tick_params(labelsize=6)
 
-
 def compensated_ylim(ax, m, F, lo=3e-5, hi=4.0):
     """Frame a compensated panel on the steady state, not on the faintest isochrone."""
     y = np.asarray(F, float) * np.asarray(m, float) ** 2
@@ -737,11 +466,9 @@ def compensated_ylim(ax, m, F, lo=3e-5, hi=4.0):
     if np.isfinite(top) and top > 0:
         ax.set_ylim(top * lo, top * hi)
 
-
 def plot_spectrum(ax, run, spec=None, plateau=None, compensate=True, errorbars=True,
                   color="k", label="measured"):
-    """Spectrum with error bars, compensated as m^2 dN/dm by default.  Every fit is
-    done on the raw dN/dm; the compensation is applied at draw time only."""
+    """Spectrum with error bars, compensated as m^2 dN/dm by default."""
     s = spec if spec is not None else spectrum(run)
     c = np.asarray(run["centers"], float)
     f = c ** 2 if compensate else np.ones_like(c)
@@ -762,13 +489,9 @@ def plot_spectrum(ax, run, spec=None, plateau=None, compensate=True, errorbars=T
     ax.set_ylabel(r"$m^2\,dN/dm$" if compensate else "dN/dm")
     return s
 
-
 def plot_growth(axs, run, iso=None, pl=None, fit=None, k=None, b_theory=None,
                 color="C0", tag=""):
-    """
-    Two panels: <m>(tau) with error bars and every age bin visible, and the local
-    slope beside it so the plateau can be seen rather than trusted.
-    """
+    """Two panels: <m>(tau) with error bars and every age bin visible, and the local slope beside it so the plateau can be seen rather than trusted."""
     if iso is None:
         iso, pl, fit, k = growth_law(run)
     tau, mbar, sig = iso["tau"], iso["mbar"], iso["sigma"]
@@ -790,7 +513,6 @@ def plot_growth(axs, run, iso=None, pl=None, fit=None, k=None, b_theory=None,
         a.plot(tau[k], mbar[k][0] * (tau[k] / tau[k][0]) ** b_theory, ":", lw=1.6,
                color="C1", label=r"theory $\tau^{%.1f}$" % b_theory)
     a.set_xscale("log"); a.set_yscale("log")
-    # frame on the data: the extrapolated fit spans twenty decades and would own the axis
     a.set_ylim(np.nanmin(mbar[have]) / 3.0, np.nanmax(mbar[have]) * 3.0)
     a.set_xlabel(r"age $\tau$"); a.set_ylabel(r"$\langle m\rangle$")
     a.set_title("%s — growth law, all data" % tag, fontsize=9)
@@ -825,20 +547,8 @@ def plot_growth(axs, run, iso=None, pl=None, fit=None, k=None, b_theory=None,
     a2.legend(fontsize=6, loc="upper left")
     return iso, pl, fit, k
 
-
 def growth_compare(run, groups=None, correct_repeats=True, **kw):
-    """
-    The growth law measured twice on the same particles: once on the age grid as
-    recorded, once on the merged age bins the isochrone panel is drawn from.
-
-    This is the check that the rebinning is honest.  Merging age bins is exactly
-    what a coarser `iso_age_edges` would have produced, so b must come back the
-    same; if it does not, the widened bins are straddling curvature and the picture
-    is showing something the fit never saw.  The two numbers, not one, are the
-    result.
-
-    Returns dict with the fine and rebinned isochrone dicts, plateaus, fits and masks.
-    """
+    """The growth law measured twice on the same particles: once on the age grid as recorded, once on the merged age bins the isochrone panel is drawn from."""
     iso = iso_mean_mass(run, correct_repeats=correct_repeats)
     pl = growth_plateau(iso["tau"], iso["mbar"], iso["counts"], **kw)
     k = (np.isfinite(iso["mbar"]) & (iso["tau"] >= pl["tau_lo"])
@@ -854,14 +564,9 @@ def growth_compare(run, groups=None, correct_repeats=True, **kw):
                   rms_resid=np.nan, n=0))
     return dict(iso=iso, pl=pl, fit=fit, k=k, groups=groups, iso_g=iso_g, fit_g=fit_g)
 
-
 def plot_growth_compare(axs, run, cmp=None, groups=None, b_theory=None,
                         color="C0", tag=""):
-    """
-    The two growth laws side by side: the original fine age bins and the merged ones
-    the isochrones were drawn from.  Left, <m>(tau) with both fits; right, the local
-    slope of both, so a disagreement shows up as a shape rather than as a number.
-    """
+    """The two growth laws side by side: the original fine age bins and the merged ones the isochrones were drawn from."""
     if cmp is None:
         cmp = growth_compare(run, groups=groups)
     iso, pl, fit, k = cmp["iso"], cmp["pl"], cmp["fit"], cmp["k"]
@@ -931,28 +636,13 @@ def plot_growth_compare(axs, run, cmp=None, groups=None, b_theory=None,
     a2.legend(fontsize=6, loc="upper left")
     return cmp
 
-
-# ======================================================================
-#  SAVING  --  used by the run notebooks, kept here so there is one module
-# ======================================================================
-
 def check_grid(edges, *masses):
-    """
-    Refuse to start if a characteristic mass falls outside the bin grid.
-
-    The bin-pair majorant is built from bin UPPER CORNERS, and mass_to_bin CLAMPS
-    anything above the top edge into the last bin -- whose corner is then smaller
-    than the particle itself -- so K(m,m) exceeds its own majorant and the engine
-    raises "Majorant violated" on the very first pair.  With a constant kernel that
-    is impossible; with any lambda > 0 it is immediate, and the traceback points at
-    the majorant rather than at the grid.
-    """
+    """Refuse to start if a characteristic mass falls outside the bin grid."""
     e = np.asarray(edges, float)
     bad = [float(m) for m in masses if m is not None and not (e[0] < m < e[-1])]
     if bad:
         raise ValueError("masses %s fall outside the grid (%.3g, %.3g) -- widen EDGES"
                          % (bad, e[0], e[-1]))
-
 
 def _jsonable(v):
     if v is None or isinstance(v, (str, bool)):
@@ -962,39 +652,8 @@ def _jsonable(v):
     except (TypeError, ValueError):
         return str(v)
 
-
-# ======================================================================
-#  GENERATIONS  --  the split count, carried by every particle
-# ======================================================================
-#
-#  WHAT THIS REPLACES.  v2/v3 measured the number of splits along a path with tagged
-#  tracer chains.  The number does not need a path: it is a property of the PARTICLE,
-#  one int32, so v4 carries it on all of them.  The tree count, the shelf at m_inj and
-#  the censoring by the sink -- the three things that limited the tracers -- are gone,
-#  because a particle contributes while it is alive and its generation does not care
-#  how long it waited or whether it survives a full descent.
-#
-#  THE TWO WEIGHTINGS ARE NOT THE SAME, and this is the one thing to get right.
-#  gen_counts counts BOTH fragments, so it is NUMBER weighted and one step of a
-#  uniform split gives <ln xi> = -1, Var = 1.  gen_mass weights by mass, which is what
-#  a tracer did when it followed a fragment with probability xi, and gives -1/2 and
-#  1/4.  Mass weighting is the default here for a practical reason as well as a
-#  principled one: the packet moves half as fast, so it stays clear of the sink for
-#  twice as many generations.  Measured over three decades: number weighting departs
-#  from the line at g = 4, mass weighting holds to g = 10.
-
-
 def steady_mean_mass(alpha, m_lo, m_hi):
-    """
-    <m> = M/N for a truncated power law F ~ m^alpha on [m_lo, m_hi].  Sizes the initial
-    condition: the box must hold N_ss * <m> of mass, so N0 = N_ss * <m> / m_inj.
-
-    Not cosmetic.  The clock is dt = 2V/(wR) with R ~ N^2, so the physical time spent
-    filling goes as 1/N0 and the deterministic injector delivers q*t bodies during it.
-    Measured at three decades: N0 = 4 injects 705 bodies during the fill, N0 = 180
-    injects 200, N0 = 1000 injects 38.  At the low end the run is a decaying cascade
-    wearing the costume of an open one.
-    """
+    """<m> = M/N for a truncated power law F ~ m^alpha on [m_lo, m_hi]."""
     a_, lo, hi = float(alpha), float(m_lo), float(m_hi)
 
     def _int(e):
@@ -1003,67 +662,8 @@ def steady_mean_mass(alpha, m_lo, m_hi):
 
     return _int(a_ + 1.0) / _int(a_)
 
-
-# ======================================================================
-#  [v5]  THE WAITING LAW  --  b measured as a TIME, not as a density
-# ======================================================================
-#
-#  <dt>(m) is the mean time a particle sits at mass m between successive
-#  events that change its mass.  The engine accumulates it two ways
-#  (engine note [14]):
-#
-#    'exposure'  occupancy / events.  Int N_b(t) dt over the number of
-#                stays that ended in b.  Unbiased under censoring; use it.
-#    'interval'  mean of the completed intervals.  Censored at large m,
-#                which flattens the slope and INFLATES b.  Kept as the
-#                cross-check: exposure and interval agreeing means the
-#                run is long compared with the longest waiting time.
-#
-#  WHAT IT IS AND IS NOT INDEPENDENT OF.  Against a power-law background
-#  the disruption rate of a body of mass m is, by homogeneity of K,
-#
-#      nu(m) = Int_{f m}^{m} K(m,m') n(m') dm'  ~  m^(lambda + alpha + 1),
-#
-#  so the slope of <dt> and alpha carry the SAME exponent information:
-#
-#      1/b = -(1 + lambda + alpha)          [waiting law]
-#      1/b =   2 + alpha                    [flux closure]
-#
-#  and both have db/dalpha = b^2.  Nobody escapes the amplification --
-#  b = 6 is a large number manufactured out of a small one, and that is
-#  physics, not a defect in the estimator.  QUOTE 1/b, WITH ITS ERROR,
-#  AND LET b BE THE DERIVED NUMBER.
-#
-#  What the waiting law does buy, and it is worth having:
-#    - it is a TIME, measured directly, not an exponent inferred from a
-#      density plus a flux argument.  The two routes above differ by
-#      (1 - lambda)/2 - (2 + alpha) evaluated off the fixed point, so
-#      comparing them TESTS the closure instead of assuming it;
-#    - it is MEMORYLESS, so it is valid on a seeded population from t = 0
-#      -- which is the entire reason the warm start exists;
-#    - it is LOCAL: only the bins next to the sink are censored, not the
-#      whole trajectory, which is what killed tau(g) in v4.
-
-
 def waiting_band(run, pad_decades=(1.0, 0.15)):
-    """The default fitting window for <dt>(m), and it is DELIBERATELY ASYMMETRIC.
-
-    Measured on a three-decade fragmentation run, the local slope of <dt>:
-
-        m/m_sink < ~5     slope -2.7, -1.1, -0.8, then +1.1  -- garbage
-        m/m_sink ~ 7..700 slope 0.10 .. 0.30, mean ~0.17     -- the law
-        top bin           slope -0.16                        -- injection pile
-
-    The sink is a HARD truncation and it reaches about a decade up: a particle
-    one bin above it is destroyed on its next event whatever the kinetics say,
-    so <dt> there measures the boundary.  The injection end is a source at a
-    single mass and contaminates only the bin it lands in.  Padding the two
-    ends equally therefore throws away good data at the top and keeps bad data
-    at the bottom -- which is exactly the mistake that turned a clean 1/b =
-    0.174 into 0.220.
-
-    pad_decades: scalar, or (pad at the sink end, pad at the injection end).
-    """
+    """The default fitting window for <dt>(m), and it is DELIBERATELY ASYMMETRIC."""
     meta = run["meta"]
     m_inj = float(meta.get("injection_mass") or meta["ic"]["m"])
     m_sink = float(meta.get("sink_mass") or 0.0)
@@ -1074,41 +674,14 @@ def waiting_band(run, pad_decades=(1.0, 0.15)):
     if m_sink <= 0 or not np.isfinite(m_sink):
         c = np.asarray(run["centers"], float)
         return float(c.min()), float(c.max())
-    if m_sink < m_inj:                       # fragmentation: sink below
+    if m_sink < m_inj:
         return m_sink * 10.0 ** p_lo, m_inj / 10.0 ** p_hi
-    return m_inj * 10.0 ** p_hi, m_sink / 10.0 ** p_lo   # coagulation: sink above
-
+    return m_inj * 10.0 ** p_hi, m_sink / 10.0 ** p_lo
 
 def waiting_law(run, estimator="exposure", gated=None, band=None,
                 pad_decades=(1.0, 0.15), min_events=200.0, weighted=False,
                 verbose=False, _cross=True):
-    """
-    Fit <dt>(m) = A m^(1/b) and return 1/b, b and the diagnostics.
-
-    band          (m_lo, m_hi) to fit over.  Default: waiting_band(), which is
-                  asymmetric for the reason given there.
-    gated         True  -> the accumulator that started at the steady-state
-                           gate; False -> the one that started at t = 0.
-                  None (default) -> gated if it holds enough events, and the
-                  choice is reported.
-    min_events    a bin needs this many ended stays to enter the fit.
-    weighted      False by DEFAULT, and that is not laziness.  The Poisson
-                  error on a bin with 2e4 events is 0.7%, far below the real
-                  bin-to-bin scatter, which is systematic (residual curvature
-                  from the boundaries) and not statistical.  Weighting by the
-                  Poisson error therefore hands the fit to whichever bin has
-                  the most counts -- always the one nearest the sink, always
-                  the worst one.  Measured on the same run: unweighted gives
-                  1/b = 0.174 +- 0.006 with chi2/dof from the scatter;
-                  weighted gives anything from 0.13 to 0.22 with chi2/dof
-                  between 3 and 260 depending on where the window ends.
-                  Switch it on only after chi2/dof has come down to order 1.
-
-    Returns a dict with p = 1/b and sigma_p (from the scatter), b and
-    sigma_b = b^2 sigma_p, `p_spread` -- the SYSTEMATIC, i.e. how much 1/b
-    moves when the window is trimmed -- and the other estimator's slope, so
-    censoring can be read off rather than assumed.
-    """
+    """Fit <dt>(m) = A m^(1/b) and return 1/b, b and the diagnostics."""
     if "wait_mean" not in run:
         raise ValueError("this run carries no waiting law "
                          "(engine older than v5, or track_waiting=False)")
@@ -1117,7 +690,6 @@ def waiting_law(run, estimator="exposure", gated=None, band=None,
     m_inj = float(meta.get("injection_mass") or meta["ic"]["m"])
     m_sink = float(meta.get("sink_mass") or 0.0)
 
-    # --- which accumulator ------------------------------------------------
     def _pair(g):
         sfx = "_gated" if g else ""
         return (np.asarray(run["wait_mean" + sfx], float),
@@ -1137,7 +709,6 @@ def waiting_law(run, estimator="exposure", gated=None, band=None,
     elif estimator != "exposure":
         raise ValueError("estimator must be 'exposure' or 'interval'")
 
-    # --- the fitting window ----------------------------------------------
     if band is None:
         band = waiting_band(run, pad_decades)
     band = (min(band), max(band))
@@ -1147,12 +718,6 @@ def waiting_law(run, estimator="exposure", gated=None, band=None,
     fit = wls_powerlaw(c, y, sy=(sy if weighted else None), mask=mask)
     p, sp = fit["p"], fit["sigma_p"]
 
-    # --- SYSTEMATIC: how much does 1/b move if the window is trimmed? -----
-    # The statistical error above is the scatter about one particular window.
-    # It says nothing about the choice of window, which is the larger error on
-    # a shallow slope.  Trim a quarter and a half decade off each end and
-    # report the full spread; if that exceeds sigma_p, the window is the
-    # dominant uncertainty and quoting sigma_p alone is dishonest.
     trials = []
     for dlo in (0.0, 0.25, 0.5):
         for dhi in (0.0, 0.25):
@@ -1165,13 +730,8 @@ def waiting_law(run, estimator="exposure", gated=None, band=None,
                     trials.append(q)
     p_spread = float(np.max(trials) - np.min(trials)) if len(trials) > 1 else np.nan
     b = 1.0 / p if (np.isfinite(p) and p != 0.0) else np.nan
-    # db/d(1/b) = -b^2.  The SIGN of the amplification does not matter, its
-    # size does: at b = 6 a 1% error in the slope is a 6% error in b.
     sb = (b ** 2) * sp if np.isfinite(b) and np.isfinite(sp) else np.nan
 
-    # --- the other estimator, for the censoring check ---------------------
-    # _cross=False on the inner call, or the two estimators call each other for
-    # ever.  One level deep is all the cross-check needs.
     other = "interval" if estimator == "exposure" else "exposure"
     p_other = np.nan
     if _cross:
@@ -1182,9 +742,6 @@ def waiting_law(run, estimator="exposure", gated=None, band=None,
         except Exception:
             p_other = np.nan
 
-    # `n` stays what wls_powerlaw meant by it -- the number of BINS in the fit.
-    # The per-bin event counts go in under their own name; overloading `n` here
-    # is how the report ended up trying to print an array with %d.
     out = dict(fit)
     out.update(p=p, sigma_p=sp, b=b, sigma_b=sb, mask=mask, m=c, dt=y, sem=sy,
                n_events=n, band=tuple(band), gated=bool(gated), estimator=estimator,
@@ -1197,11 +754,8 @@ def waiting_law(run, estimator="exposure", gated=None, band=None,
         print(waiting_report(run, out))
     return out
 
-
 def waiting_report(run, wl=None, alpha=None, sigma_alpha=None):
-    """Text block: 1/b and b from the waiting law, next to b from the closure,
-    with the censoring check and the honest fraction.  Everything a reader needs
-    to decide whether to believe the number."""
+    """Text block: 1/b and b from the waiting law, next to b from the closure, with the censoring check and the honest fraction."""
     wl = wl if wl is not None else waiting_law(run)
     lam = run["meta"].get("lambda")
     L = ["-" * 74,
@@ -1223,19 +777,12 @@ def waiting_report(run, wl=None, alpha=None, sigma_alpha=None):
                     "consistent" if abs(d) <= 2 * wl["sigma_p"]
                     else "DIFFERENT -> censoring, run longer"))
     if lam is not None and np.isfinite(lam):
-        #  b = 2/(1-lambda) is infinite AT lambda = 1, which is not a numerical
-        #  accident but the physics: there the drift is exponential and there is
-        #  no growth exponent to quote.  Printing it as inf rather than dividing
-        #  by zero keeps the marginal kernel runnable.
         _invb_th = 0.5 * (1.0 - lam)
         _b_th = (2.0 / (1.0 - lam)) if abs(1.0 - lam) > 1e-12 else np.inf
         L.append("  theory        1/b = (1-lambda)/2 = %+.5f   ->  b = %s"
                  % (_invb_th, ("%.3f" % _b_th) if np.isfinite(_b_th)
                     else "inf  (lambda = 1: exponential drift, no growth exponent)"))
     if alpha is not None and np.isfinite(alpha):
-        # 1/b = 2 + alpha  (flux closure) and 1/b = -(1+lambda+alpha) (kinetic).
-        # Printing both is the point: they agree only ON the fixed point, so the
-        # gap between them measures how far this run still is from it.
         L.append("  from alpha    alpha = %+.4f%s" %
                  (alpha, "" if sigma_alpha is None else " +- %.4f" % sigma_alpha))
         L.append("                closure  1/b = 2+alpha        = %+.5f  ->  b = %.3f"
@@ -1263,15 +810,8 @@ def waiting_report(run, wl=None, alpha=None, sigma_alpha=None):
     L.append("-" * 74)
     return "\n".join(L)
 
-
 def time_avg_spectrum(run, gated=None):
-    """dN/dm averaged over the run rather than sampled at snapshots.
-
-    The engine's occupancy integral Int N_b(t) dt is exact and free (it is the
-    denominator of the waiting law), so this spectrum is smooth where the
-    snapshot average is ragged, and it is weighted by TIME rather than by
-    however the snapshots happened to fall.  Returns (m, F) or (None, None) on
-    a pre-v5 run."""
+    """dN/dm averaged over the run rather than sampled at snapshots."""
     if "dndm_time_avg" not in run:
         return None, None
     if gated is None:
@@ -1280,19 +820,14 @@ def time_avg_spectrum(run, gated=None):
     key = "dndm_time_avg_gated" if gated else "dndm_time_avg"
     return np.asarray(run["centers"], float), np.asarray(run[key], float)
 
-
 def seed_spectrum(alpha, m_lo, m_hi, N, rng=None):
-    """N masses from n(m) ~ m^alpha on [m_lo, m_hi].  Re-exported from the engine
-    so a notebook can draw the seed it is about to hand to simulate()."""
+    """N masses from n(m) ~ m^alpha on [m_lo, m_hi]."""
     if sample_powerlaw is None:
         raise ValueError("the engine on the path has no seeding (need v5)")
     return sample_powerlaw(alpha, m_lo, m_hi, N, rng)
 
-
 def honesty(run):
-    """The seeded fraction as a time series: how much of the run is usable for
-    anything that depends on ancestry (generations, isochrones, ages).  On a cold
-    run this is 1.0 everywhere by construction."""
+    """The seeded fraction as a time series: how much of the run is usable for anything that depends on ancestry (generations, isochrones, ages)."""
     if "honest_num" not in run:
         return None
     return {"t": np.asarray(run["t"], float),
@@ -1301,59 +836,9 @@ def honesty(run):
             "mass": np.asarray(run["honest_mass"], float),
             "seeded": bool(run["meta"].get("seeded", False))}
 
-
-# ======================================================================
-#  [v5]  STATIONARITY  --  when a checkpoint may be taken
-# ======================================================================
-#
-#  TWO POPULAR CRITERIA DO NOT WORK, and that is measured, not assumed.
-#
-#  M_out/M_in.  From the exact identity M_out = M_in + M_sys(0) - M_sys(t)
-#  it follows that M_out/M_in = 1 + dM_sys/M_in, which tends to one simply
-#  because M_in grows without bound.  The criterion says one thing: the run
-#  is longer than the fill.  About the SHAPE of the spectrum it says
-#  nothing.
-#
-#  dn_out/devents.  Reaches one after a fifth of a single flush and then
-#  stays there.  It is a balance of NUMBER, and number lives at the sink
-#  and equilibrates on t_turn, whereas the shape lives at the top and
-#  equilibrates on tau_res -- longer by a factor <m>/m_sink (45 times over
-#  six decades).
-#
-#  Measured on a cold six-decade run, in flushes of the box
-#  (one flush = M_sys/m_sink events):
-#
-#      flushes   live/1e6   <m>     alpha    dn_out/dev   M_out/M_in
-#        0.18      14.3     16.2   -1.890       0.96
-#        0.46       9.4     22.5   -1.881       1.01
-#        0.73       8.1     24.4   -1.879       1.02
-#        1.01       6.9     26.6   -1.862       1.02
-#        1.29       5.9     30.6   -1.829       1.02         1.016
-#
-#  Both "criteria" reported success at 0.2 of a flush.  Meanwhile <m> was
-#  growing by 14 per flush and alpha was moving, faster at the end than at
-#  the beginning.  Only <m> and alpha work, compared between the two
-#  halves of the tail.
-
-
 def stationarity(run, tail=0.5, tol_mbar=0.03, tol_alpha=0.010,
                  tol_msys=0.03, band_pad=1.0, verbose=False):
-    """THE TOLERANCES ARE STATED PER FLUSH, not per comparison window.  That is
-    not a detail: it is the only thing that makes the test meaningful on a short
-    run.
-
-    The shift between the halves of the tail gets smaller the shorter the run is,
-    because the window shrinks with it.  Comparing such a shift with a fixed
-    threshold means declaring stationary anything that is short enough.  Measured
-    on two cold runs of the same configuration:
-
-        length 1.31 flushes:  shift of <m> +13.0%  over a separation of 0.33 flushes
-        length 0.29 flushes:  shift of <m>  +2.8%  over a separation of 0.073 flushes
-
-    The second would pass a 3% threshold and be declared STATIONARY at <m> = 16.8
-    against a limiting 45 and M_out/M_in = 0.32.  Divided by the separation, both
-    give the SAME rate -- 39% per flush -- and both are honestly declared to be
-    still moving."""
+    """Tolerances are stated per flush, not per comparison window."""
     """Whether the run is stationary enough to take a checkpoint from it.
 
     The TAIL of the run is taken (the last fraction `tail` of the snapshots),
@@ -1373,7 +858,6 @@ def stationarity(run, tail=0.5, tol_mbar=0.03, tol_alpha=0.010,
     about four times smaller than the typical scatter of the plateau, i.e. a
     demand stricter than the accuracy with which alpha can be measured at all.
     """
-
 
     e = np.asarray(run["events"], float)
     if e.size < 8:
@@ -1405,12 +889,6 @@ def stationarity(run, tail=0.5, tol_mbar=0.03, tol_alpha=0.010,
         return {"ok": False, "report": "the tail is too short for two halves",
                 "n": int(e.size)}
 
-    #  THE ERROR ON THE SHIFT, without which the verdict would be guesswork.
-    #  Snapshots are STRONGLY correlated -- adjacent ones share almost the whole
-    #  population -- so the naive error from their number is too small by a
-    #  factor of several.  effective_snapshots returns K(1-rho)/(1+rho) from the
-    #  lag-one autocorrelation; on real runs, out of 168 snapshots about four
-    #  turn out to be independent.
     def _cmp(x, rel):
         a, b = np.nanmean(x[A]), np.nanmean(x[B])
         sa = np.nanstd(x[A]) / np.sqrt(max(effective_snapshots(x[A]), 1.0))
@@ -1428,9 +906,6 @@ def stationarity(run, tail=0.5, tol_mbar=0.03, tol_alpha=0.010,
     al_a, al_b, d_al, s_al = _cmp(al, False)
     dn = (no[-1] - no[i0]) / max(e[-1] - e[i0], 1.0)
 
-    #  THE SEPARATION of the halves in flushes -- the shift is divided by it.
-    #  The mean positions of the halves are used, not their edges: a shift
-    #  between means belongs to the distance between those means.
     flush0 = Ms[0] / m_sink if m_sink > 0 else np.nan
     span = (float(e[B].mean()) - float(e[A].mean())) / flush0 if np.isfinite(flush0) else np.nan
     if not np.isfinite(span) or span <= 0:
@@ -1440,10 +915,6 @@ def stationarity(run, tail=0.5, tol_mbar=0.03, tol_alpha=0.010,
     d_al, s_al = d_al / span, s_al / span
 
     flush = flush0
-    #  THREE outcomes, not two.  A shift can be (a) small -- converged;
-    #  (b) large AND significant -- moving; (c) large but within its own error --
-    #  nothing can be said, more statistics are needed.  Without the third case
-    #  the test would confidently report "moving" on noise in a short run.
     checks = [("<m>", d_mb, s_mb, tol_mbar), ("alpha", d_al, s_al, tol_alpha),
               ("M_sys", d_ms, s_ms, tol_msys)]
 
@@ -1490,13 +961,6 @@ def stationarity(run, tail=0.5, tol_mbar=0.03, tol_alpha=0.010,
         L.append("  (the error on the shift is computed from INDEPENDENT snapshots:")
         L.append("   adjacent ones share the population, and the naive error from")
         L.append("   their number is too small by a factor of several.)")
-    # ---- how much longer, if it has not converged ----------------------
-    #  Model: <m>(n) = M_inf - A exp(-n/n0) in flushes n.  The DRIFT measured
-    #  on a window then decays as exp(-n/n0) with the same n0, so n0 follows
-    #  from comparing the drift on two consecutive windows, and the number of
-    #  flushes to the tolerance is n0 * ln(d/tol).  Linear extrapolation is
-    #  useless here in principle: at a constant drift rate convergence never
-    #  arrives, and "so much longer" would be an invention.
     est = np.nan
     if not ok and np.isfinite(d_mb) and abs(d_mb) > tol_mbar and np.isfinite(flush):
         t0 = max(int(e.size * (1.0 - min(tail * 1.5, 0.9))), 0)
@@ -1528,14 +992,8 @@ def stationarity(run, tail=0.5, tol_mbar=0.03, tol_alpha=0.010,
             "flushes_left": float(est),
             "mbar_series": mbar, "alpha_series": al, "events": e}
 
-
 def generations(run, weight="mass"):
-    """
-    Unpack the generation histogram.  weight is 'mass' or 'number'.
-
-    Returns dict(g, H, centers, widths, x, num, tau, n_eff) where H[g] is the mass (or
-    number) distribution of generation g over the mass grid, and x = ln(m/m_inj).
-    """
+    """Unpack the generation histogram."""
     if "gen_counts" not in run:
         raise ValueError("this run carries no generation histogram (engine older than v4)")
     H = np.asarray(run["gen_mass" if weight == "mass" else "gen_counts"], float)
@@ -1550,22 +1008,8 @@ def generations(run, weight="mass"):
             "m_inj": minj, "m_sink": float(run["meta"].get("sink_mass") or 0.0),
             "weight": weight, "snapshots": float(run.get("gen_snapshots", 0.0))}
 
-
 def gen_moments(gen, min_count=500.0, clear_sink=2.0):
-    """
-    <x> and Var(x) per generation, with a VALIDITY MASK.
-
-    The mask is the whole point.  The sink truncates the packet from below, so a
-    generation whose distribution has reached it is measuring the boundary, not the
-    walk -- its mean saturates and its variance collapses towards zero.  A generation
-    counts as usable while
-
-        <x> - clear_sink * sigma  >  ln(m_sink / m_inj),
-
-    i.e. while the packet is still `clear_sink` standard deviations clear of the sink.
-    Fitting through the saturated tail is the documented way to get a clean-looking
-    slope that is simply wrong.
-    """
+    """<x> and Var(x) per generation, with a VALIDITY MASK."""
     H, x = gen["H"], gen["x"]
     xs = np.log(gen["m_sink"] / gen["m_inj"]) if gen["m_sink"] > 0 else -np.inf
     n = H.sum(axis=1)
@@ -1577,16 +1021,8 @@ def gen_moments(gen, min_count=500.0, clear_sink=2.0):
         mu[g] = float((p * x).sum())
         va[g] = float((p * (x - mu[g]) ** 2).sum())
     ok = np.isfinite(mu) & (mu - clear_sink * np.sqrt(np.maximum(va, 0)) > xs)
-    ok[0] = False                      # generation 0 has not moved yet
+    ok[0] = False
 
-    #  SECOND CUT, and it matters for tau(g) rather than for the moments.  Every split
-    #  makes two particles out of one, so the number that REACH generation g DOUBLES
-    #  with g -- it is not flat, and treating it as flat is wrong.  What is flat is the
-    #  ratio reach_n[g] / reach_n[g-1] = 2, and it stays at 2 exactly until the sink
-    #  starts removing fragments before they can split again.  Measured on a
-    #  three-decade test: 1.93, 1.96, 2.03, 2.09, 2.05, then 1.94, 1.76, 1.60, 1.43 --
-    #  the sink bites at g = 7.  Beyond that the particles that reached g are the FAST
-    #  ones, a survivor bias that compresses tau(g) and drags b down.
     rn = np.asarray(gen.get("reach_n", n), float)
     with np.errstate(invalid="ignore", divide="ignore"):
         ratio = np.full(rn.size, np.nan)
@@ -1596,25 +1032,10 @@ def gen_moments(gen, min_count=500.0, clear_sink=2.0):
             "ok_flux": ok & ok_flux, "reach_n": rn, "reach_ratio": ratio,
             "x_sink": xs}
 
-
 def gen_growth(gen, mom=None, min_count=500.0, s_max=120.0):
-    """
-    b from <tau>(g): the mean time to reach generation g, over the whole population.
-
-    Same statement as the tracer version, on 10^4 times the sample.  Splits happen at
-    rate nu(m) ~ m^(beta-1) and <ln m> falls by <ln xi> per split, so with
-    beta - 1 = -1/b,
-
-        tau(g) = T (1 - exp(-g / (2b / |<ln xi>| / 2)))   ->  scale = b / |<ln xi>|.
-
-    With the MASS weighting <ln xi> = -1/2 and the scale is 2b, exactly as for the
-    tracers; with NUMBER weighting <ln xi> = -1 and the scale is b.  `resid` against
-    `resid_linear` is the verdict: a tau(g) that is barely curved does not determine b.
-    """
+    """b from <tau>(g): the mean time to reach generation g, over the whole population."""
     if mom is None:
         mom = gen_moments(gen, min_count=min_count)
-    #  tau(g) is fitted on the flux-flat range only -- see gen_moments.  Outside it the
-    #  sample at each g is the fast tail and the curve is compressed.
     k = mom.get("ok_flux", mom["ok"]) & np.isfinite(gen["tau"])
     if k.sum() < 4:
         return {"b": np.nan, "T": np.nan, "g": gen["g"][k], "tau": gen["tau"][k],
@@ -1634,20 +1055,8 @@ def gen_growth(gen, mom=None, min_count=500.0, s_max=120.0):
             "resid": float(rs.min() / tf.std()),
             "resid_linear": float(np.std(tf - np.polyval(lin, gf)) / tf.std())}
 
-
 def step_stats(frag_split_width, weight="mass"):
-    """
-    (<ln xi>, Var(ln xi)) for ONE split, exactly, by quadrature.
-
-    weight='mass'   -- the piece is met with probability xi (p ~ xi): -1/2, 1/4 at w=1/2.
-    weight='number' -- both pieces counted equally:                   -1,   1    at w=1/2.
-
-    No free parameter, which is what makes <x> and Var(x) against g the sharpest test
-    in the analysis.  The skewness of one step is -2 whenever the piece can be
-    arbitrarily small, because ln of it then has an exponential tail; only "always the
-    heavier" is bounded and comes out nearly symmetric.  Skewness after g steps falls
-    as 1/sqrt(g), so it is a small-g transient, not an obstruction.
-    """
+    """(<ln xi>, Var(ln xi)) for ONE split, exactly, by quadrature."""
     xi = np.linspace(0.5 - frag_split_width, 0.5 + frag_split_width, 200001)[1:-1]
     tz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     p = (xi if weight == "mass" else np.ones_like(xi))
@@ -1655,25 +1064,8 @@ def step_stats(frag_split_width, weight="mass"):
     mu = float(tz(p * np.log(xi), xi))
     return mu, float(tz(p * np.log(xi) ** 2, xi) - mu ** 2)
 
-
 def add_last_run(run, name, analysis=None, drop_particles=True, runs_dir="runs"):
-    """
-    Write one finished run to runs/<name>.npz, replacing the previous one.
-
-    Everything simulate() returns is kept except `final_mass`, `final_inj_time` and
-    `final_age`: those carry the whole live population, one float per particle, and no
-    figure needs them because the spectra and the isochrone histogram are stored in
-    their own right.  (`final_age` arrived with the v3 spin-up, where the triple
-    (final_mass, final_age) IS the initial condition of the next run -- so if that is
-    what you are saving, pass drop_particles=False and save it under its own name;
-    it does not belong in a run archive that the analysis notebooks reload.)
-
-    EVERYTHING TRACER-RELATED IS KEPT: `tracer_hist`, `tracer_done`, `tracer_t0_all`,
-    `tracer_m0_all`.  The full trajectory log is the point of the feature and it is
-    chain-indexed, not particle-indexed, so it does not scale with N.  `analysis` is merged into meta, which save_run stores as JSON, so it
-    survives load without any engine change; `stop_reason` is copied there too
-    because save_run drops top-level strings.
-    """
+    """Write one finished run to runs/<name>.npz, replacing the previous one."""
     import os
     payload = {k: v for k, v in run.items()
                if not (drop_particles and k in ("final_mass", "final_inj_time",
