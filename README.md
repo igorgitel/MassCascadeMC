@@ -61,8 +61,7 @@ python run_local_lambda1.py --process frag --add-hours 8 --outdir runs_lambda1
   by the ratio of the measured population to 1e6, and calibration stops
   when that ratio is within 5%; otherwise the q after the third round is
   used. This takes about 20 minutes. To skip it, give q directly:
-  `--q 586053` for $\lambda = 2/3$, `--q 784682` for $\lambda = 1$ (the
-  values used for the paper). For coagulation q is computed directly.
+  `--q 586053` for $\lambda = 2/3$, `--q 784682` for $\lambda = 1$. For coagulation q is computed directly.
 - Each checkpoint writes eight state files of about 11 MB; keep the output
   folders out of OneDrive or Dropbox.
 - The printed report gives the measured index, its `drift per decade`
